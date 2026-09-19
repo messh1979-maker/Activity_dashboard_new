@@ -1,284 +1,184 @@
-from typing import Optional, List, Tuple, Dict, Any
+"""Chat service — raw SQL against the real DDL (schema ``chat``).
+
+Architecture Reference: Sections 8.1, 8.2, 8.3.
+"""
+from typing import Optional, List
+from types import SimpleNamespace
 from uuid import UUID
 from datetime import datetime
 
-from sqlalchemy import select, func, delete, insert, update
-from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from app.core.errors import APIError, NotFoundError
-from app.modules.chat.ports import (
-    RoomCreate, RoomUpdate, MessageCreate, MessageResponse,
-    MemberCreate, ChatExport
-)
-from app.modules.chat.db.Models import Rooms, RoomMembers, Messages
+
+
+def _iso(v):
+    return v.isoformat() if isinstance(v, datetime) else v
 
 
 class ChatService:
-    """Service layer for Chat module operations."""
-    
-    def __init__(self, session: Session):
+    """Service layer for Chat module operations (real DDL)."""
+
+    def __init__(self, session):
         self.session = session
-    
-    # --- Room CRUD ---
-    
-    async def create_room(
-        self, title: str, linked_type: Optional[str],
-        linked_id: Optional[UUID], owner_id: UUID
-    ) -> Rooms:
+
+    async def _member_of(self, room_id: UUID, user_id: UUID) -> bool:
+        row = (await self.session.execute(text("""
+            SELECT 1 FROM chat.room_members
+             WHERE room_id = :rid AND user_id = :uid AND left_at IS NULL
+        """), {"rid": str(room_id), "uid": str(user_id)})).first()
+        return row is not None
+
+    async def create_room(self, title: str, linked_type: Optional[str],
+                          linked_id: Optional[UUID], owner_id: UUID) -> SimpleNamespace:
         """Create a new chat room."""
-        room = Rooms(
-            title=title,
-            owner_id=owner_id,
-            linked_type=linked_type,
-            linked_id=str(linked_id) if linked_id else None,
-        )
-        
-        self.session.add(room)
-        await self.session.flush()
-        return room
-    
+        row = (await self.session.execute(text("""
+            INSERT INTO chat.rooms (title, linked_type, linked_id, owner_id,
+                                    is_archived, retention_days)
+            VALUES (:title, :ltype, :lid, :owner, FALSE, 30)
+            RETURNING id, title, owner_id, is_archived
+        """), {"title": title, "ltype": linked_type,
+               "lid": str(linked_id) if linked_id else None,
+               "owner": str(owner_id)})).mappings().first()
+        # Add room creator as an owner member
+        await self.session.execute(text("""
+            INSERT INTO chat.room_members (room_id, user_id, role)
+            VALUES (:rid, :uid, 'owner')
+            ON CONFLICT DO NOTHING
+        """), {"rid": row["id"], "uid": str(owner_id)})
+        await self.session.commit()
+        return SimpleNamespace(id=row["id"], title=row["title"],
+                               owner_id=row["owner_id"], is_archived=row["is_archived"])
+
     async def list_rooms(self, user_id: UUID) -> List[dict]:
         """List rooms user is member of."""
-        query = select(Rooms).join(RoomMembers).where(
-            RoomMembers.user_id == str(user_id),
-            Rooms.is_archived == False
-        )
-        results = (await self.session.execute(query)).scalars().all()
-        
-        rooms = []
-        for room in results:
-            rooms.append({
-                "id": str(room.id),
-                "title": room.title,
-                "is_archived": room.is_archived,
-                "member_count": 0,  # Would query members
-                "owner_id": str(room.owner_id),
-            })
-        
-        return rooms
-    
+        rows = (await self.session.execute(text("""
+            SELECT r.id, r.title, r.is_archived, r.owner_id, r.linked_type, r.linked_id,
+                   (SELECT count(*) FROM chat.room_members m
+                     WHERE m.room_id = r.id AND m.left_at IS NULL) AS member_count
+              FROM chat.rooms r
+              JOIN chat.room_members m ON m.room_id = r.id
+             WHERE m.user_id = :uid AND m.left_at IS NULL
+               AND r.is_archived = FALSE
+             ORDER BY r.created_at DESC
+        """), {"uid": str(user_id)})).mappings().all()
+        return [{
+            "id": str(r["id"]),
+            "title": r["title"],
+            "is_archived": r["is_archived"],
+            "member_count": int(r["member_count"]),
+            "owner_id": str(r["owner_id"]),
+            "linked_type": r["linked_type"],
+            "linked_id": str(r["linked_id"]) if r["linked_id"] else None,
+        } for r in rows]
+
     async def get_room(self, room_id: UUID, user_id: UUID) -> Optional[dict]:
         """Get room with membership check."""
-        result = await self.session.execute(
-            select(Rooms).where(Rooms.id == str(room_id))
-        )
-        room = result.scalar_one_or_none()
-        
-        if not room:
+        row = (await self.session.execute(text("""
+            SELECT id, title, owner_id, is_archived, linked_type, linked_id,
+                   retention_days, created_at
+              FROM chat.rooms WHERE id = :rid
+        """), {"rid": str(room_id)})).mappings().first()
+        if not row:
             return None
-        
-        # Check membership
-        member_result = await self.session.execute(
-            select(RoomMembers).where(
-                (RoomMembers.room_id == str(room_id)) &
-                (RoomMembers.user_id == str(user_id))
-            )
-        )
-        is_member = member_result.scalar_one_or_none() is not None
-        
-        if not is_member:
-            # Check if room is public or user has permission
-            # Simplified: return None
+        if not await self._member_of(room_id, user_id):
             return None
-        
-        # Get member count
-        count_result = await self.session.execute(
-            select(func.count()).select_from(RoomMembers).where(
-                RoomMembers.room_id == str(room_id),
-                RoomMembers.is_active == True
-            )
-        )
-        member_count = count_result.scalar() or 0
-        
+        cnt = (await self.session.execute(text("""
+            SELECT count(*) AS n FROM chat.room_members
+             WHERE room_id = :rid AND left_at IS NULL
+        """), {"rid": str(room_id)})).mappings().first()
         return {
-            "id": str(room.id),
-            "title": room.title,
-            "description": room.description,
-            "is_archived": room.is_archived,
-            "member_count": member_count,
-            "owner_id": str(room.owner_id),
-            "linked_type": room.linked_type,
-            "linked_id": room.linked_id,
+            "id": str(row["id"]),
+            "title": row["title"],
+            "description": None,
+            "is_archived": row["is_archived"],
+            "member_count": int(cnt["n"]),
+            "owner_id": str(row["owner_id"]),
+            "linked_type": row["linked_type"],
+            "linked_id": str(row["linked_id"]) if row["linked_id"] else None,
         }
-    
-    # --- Member Management ---
-    
+
     async def add_member(self, room_id: UUID, user_id: UUID, role: str,
-                        added_by: UUID) -> dict:
+                         added_by: UUID) -> dict:
         """Add member to room."""
-        # Verify room exists
-        result = await self.session.execute(
-            select(Rooms).where(Rooms.id == str(room_id))
-        )
-        room = result.scalar_one_or_none()
-        
+        room = (await self.session.execute(text(
+            "SELECT 1 FROM chat.rooms WHERE id = :rid"),
+            {"rid": str(room_id)})).first()
         if not room:
-            raise APIError(
-                error_code="ROOM_NOT_FOUND",
-                message="اتاق یافت نشد.",
-                status_code=404
-            )
-        
-        # Check if user already a member
-        existing_result = await self.session.execute(
-            select(RoomMembers).where(
-                (RoomMembers.room_id == str(room_id)) &
-                (RoomMembers.user_id == str(user_id))
-            )
-        )
-        if existing_result.scalar_one_or_none():
-            return {"status": "already_member", "message": "کاربر déjà member اتاق است."}
-        
-        # Add member
-        member = RoomMembers(
-            room_id=str(room_id),
-            user_id=str(user_id),
-            role=role,
-            source="manual",
-        )
-        
-        self.session.add(member)
-        await self.session.flush()
-        
-        return {"status": "added", "member_id": str(member.id)}
-    
-    # --- Message Operations ---
-    
-    async def send_message(self, room_id: UUID, body: str, sender_id: UUID) -> Messages:
+            raise APIError(error_code="ROOM_NOT_FOUND",
+                           message="اتاق یافت نشد.", status_code=404)
+        await self.session.execute(text("""
+            INSERT INTO chat.room_members (room_id, user_id, role, joined_at)
+            VALUES (:rid, :uid, :role, now())
+            ON CONFLICT (room_id, user_id)
+            DO UPDATE SET left_at = NULL, role = EXCLUDED.role
+        """), {"rid": str(room_id), "uid": str(user_id), "role": role})
+        await self.session.commit()
+        return {"status": "added", "room_id": str(room_id), "user_id": str(user_id)}
+
+    async def send_message(self, room_id: UUID, body: str,
+                           sender_id: UUID) -> SimpleNamespace:
         """Send a chat message."""
-        # Verify room exists and user is member
-        result = await self.session.execute(
-            select(Rooms).where(Rooms.id == str(room_id))
-        )
-        room = result.scalar_one_or_none()
-        
+        room = (await self.session.execute(text("""
+            SELECT is_archived, owner_id FROM chat.rooms WHERE id = :rid
+        """), {"rid": str(room_id)})).mappings().first()
         if not room:
-            raise APIError(
-                error_code="ROOM_NOT_FOUND",
-                message="اتاق یافت نشد.",
-                status_code=404
-            )
-        
-        # Check membership
-        member_result = await self.session.execute(
-            select(RoomMembers).where(
-                (RoomMembers.room_id == str(room_id)) &
-                (RoomMembers.user_id == str(sender_id))
-            )
-        )
-        is_member = member_result.scalar_one_or_none() is not None
-        
-        if not is_member:
-            raise APIError(
-                error_code="NOT_MEMBER",
-                message="شما_member این اتاق نیستید.",
-                status_code=403
-            )
-        
-        # Check if room is archived
-        if room.is_archived:
-            # Check if user can view archived messages
-            # Simplified: allow if owner
-            if room.owner_id != sender_id:
-                raise APIError(
-                    error_code="ROOM_ARCHIVED",
-                    message="اتاق آرشیو شده است.",
-                    status_code=403
-                )
-        
-        # Check body length
+            raise APIError(error_code="ROOM_NOT_FOUND",
+                           message="اتاق یافت نشد.", status_code=404)
+        if room["is_archived"] and str(room["owner_id"]) != str(sender_id):
+            raise APIError(error_code="ROOM_ARCHIVED",
+                           message="اتاق آرشیو شده است.", status_code=403)
+        if not await self._member_of(room_id, sender_id):
+            raise APIError(error_code="NOT_MEMBER",
+                           message="شما عضو این اتاق نیستید.", status_code=403)
         if len(body) > 4000:
-            raise APIError(
-                error_code="MESSAGE_TOO_LONG",
-                message="متن پیام بیش از حد مجاز است.",
-                status_code=400
-            )
-        
-        # Create message
-        message = Messages(
-            room_id=str(room_id),
-            sender_id=str(sender_id),
-            body=body,
-            message_type="text",
-        )
-        
-        self.session.add(message)
-        await self.session.flush()
-        
-        # Update room last activity (simplified)
-        # room.updated_at = datetime.utcnow()
-        
-        return message
-    
+            raise APIError(error_code="MESSAGE_TOO_LONG",
+                           message="متن پیام بیش از حد مجاز است.", status_code=400)
+        row = (await self.session.execute(text("""
+            INSERT INTO chat.messages (room_id, sender_id, body, message_type, is_edited)
+            VALUES (:rid, :uid, :body, 'text', FALSE)
+            RETURNING id, room_id, sender_id, body, created_at, message_type, is_edited
+        """), {"rid": str(room_id), "uid": str(sender_id), "body": body})).mappings().first()
+        await self.session.commit()
+        return SimpleNamespace(**dict(row))
+
     async def get_messages(self, room_id: UUID, viewer_id: UUID) -> List[dict]:
         """Get messages for a room."""
-        # Verify membership
-        member_result = await self.session.execute(
-            select(RoomMembers).where(
-                (RoomMembers.room_id == str(room_id)) &
-                (RoomMembers.user_id == str(viewer_id))
-            )
-        )
-        is_member = member_result.scalar_one_or_none() is not None
-        
-        if not is_member:
+        if not await self._member_of(room_id, viewer_id):
             return []
-        
-        # Get messages
-        query = select(Messages).where(Messages.room_id == str(room_id))
-        results = (await self.session.execute(query)).scalars().all()
-        
-        messages = []
-        for msg in results:
-            messages.append({
-                "id": str(msg.id),
-                "room_id": str(msg.room_id),
-                "sender_id": str(msg.sender_id),
-                "body": msg.body,
-                "sender_name": "sender",  # Would fetch user details
-                "created_at": msg.created_at.isoformat() if msg.created_at else None,
-                "message_type": msg.message_type,
-                "is_edited": msg.is_edited,
-            })
-        
-        # Sort by created_at ascending (oldest first)
-        messages.sort(key=lambda m: m["created_at"])
-        
-        return messages
-    
-    # --- Archive Room ---
-    
+        rows = (await self.session.execute(text("""
+            SELECT id, room_id, sender_id, body, message_type, is_edited,
+                   is_edited AS edited, created_at
+              FROM chat.messages
+             WHERE room_id = :rid AND deleted_at IS NULL
+             ORDER BY created_at ASC
+             LIMIT 200
+        """), {"rid": str(room_id)})).mappings().all()
+        return [{
+            "id": str(m["id"]),
+            "room_id": str(m["room_id"]),
+            "sender_id": str(m["sender_id"]),
+            "body": m["body"],
+            "sender_name": "user",
+            "created_at": _iso(m["created_at"]),
+            "message_type": m["message_type"],
+            "is_edited": m["is_edited"],
+        } for m in rows]
+
     async def archive_room(self, room_id: UUID, archived_by: UUID) -> dict:
         """Archive a chat room."""
-        result = await self.session.execute(
-            select(Rooms).where(Rooms.id == str(room_id))
-        )
-        room = result.scalar_one_or_none()
-        
+        room = (await self.session.execute(text("""
+            SELECT owner_id FROM chat.rooms WHERE id = :rid
+        """), {"rid": str(room_id)})).mappings().first()
         if not room:
-            raise APIError(
-                error_code="ROOM_NOT_FOUND",
-                message="اتاق یافت نشد.",
-                status_code=404
-            )
-        
-        # Check permission (owner or admin)
-        is_owner = room.owner_id == archived_by
-        
-        if not is_owner:
-            raise APIError(
-                error_code="PERMISSION_DENIED",
-                message="شما اجازه آرشیو این اتاق را ندارید.",
-                status_code=403
-            )
-        
-        # Archive the room
-        await self.session.execute(
-            update(Rooms).where(Rooms.id == str(room_id)).values(
-                is_archived=True,
-                archived_at=datetime.utcnow()
-            )
-        )
-        await self.session.flush()
-        
-        return {"status": "archived", "archived_at": datetime.utcnow().isoformat()}
+            raise APIError(error_code="ROOM_NOT_FOUND",
+                           message="اتاق یافت نشد.", status_code=404)
+        if str(room["owner_id"]) != str(archived_by):
+            raise APIError(error_code="PERMISSION_DENIED",
+                           message="شما اجازه آرشیو این اتاق را ندارید.", status_code=403)
+        await self.session.execute(text("""
+            UPDATE chat.rooms SET is_archived = TRUE, archived_at = now()
+             WHERE id = :rid
+        """), {"rid": str(room_id)})
+        await self.session.commit()
+        return {"status": "archived"}

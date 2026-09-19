@@ -107,7 +107,7 @@ async def check_permission(
 
 @router.post("/revoke", response_model=dict)
 async def revoke_share(
-    share_code: str = Body(...),
+    share_code: str = Body(..., embed=True),
     user_id: UUID = Depends(get_current_user),
     db_session=Depends(get_db_session)
 ):

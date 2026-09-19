@@ -10,6 +10,11 @@ import {
 } from 'react-router-dom'
 import { useAuth } from './security/authProvider'
 import DashboardPage from './features/DashboardPage'
+import ChatPage from './features/ChatPage'
+import InboxPage from './features/InboxPage'
+import GroupsPage from './features/GroupsPage'
+import ReportsPage from './features/ReportsPage'
+import SettingsPage from './features/SettingsPage'
 
 /* ---------------- Icons (inline SVG, no emoji) ---------------- */
 
@@ -34,26 +39,6 @@ const PATHS = {
   lock: 'M5 11h14a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2zM7 11V7a5 5 0 0 1 10 0v4',
   user: 'M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z',
   check: 'M20 6 9 17l-5-5',
-  spark: 'M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1',
-}
-
-/* ---------------- Placeholder ---------------- */
-
-function Placeholder({ title }: { title: string }) {
-  return (
-    <div className="animate-fade-up p-8">
-      <div className="card mx-auto max-w-lg text-center">
-        <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-brand-50 text-brand-500">
-          <Icon d={PATHS.spark} className="h-7 w-7" />
-        </div>
-        <h1 className="text-xl font-bold">{title}</h1>
-        <p className="mt-2 text-sm text-slate-500">این بخش به‌زودی پیاده‌سازی می‌شود.</p>
-        <Link to="/dashboard" className="btn-ghost mt-4">
-          بازگشت به داشبورد
-        </Link>
-      </div>
-    </div>
-  )
 }
 
 /* ---------------- Login ---------------- */
@@ -335,11 +320,11 @@ function Shell() {
         <main className="flex-1">
           <Routes>
             <Route path="/dashboard" element={<DashboardPage />} />
-            <Route path="/chat" element={<Placeholder title="گفتگوها" />} />
-            <Route path="/inbox" element={<Placeholder title="صندوق ورودی" />} />
-            <Route path="/groups" element={<Placeholder title="گروه‌ها" />} />
-            <Route path="/reports" element={<Placeholder title="گزارش‌ها" />} />
-            <Route path="/settings" element={<Placeholder title="تنظیمات" />} />
+            <Route path="/chat" element={<ChatPage />} />
+            <Route path="/inbox" element={<InboxPage />} />
+            <Route path="/groups" element={<GroupsPage />} />
+            <Route path="/reports" element={<ReportsPage />} />
+            <Route path="/settings" element={<SettingsPage />} />
             <Route path="/" element={<Navigate to="/dashboard" replace />} />
             <Route path="*" element={<Navigate to="/dashboard" replace />} />
           </Routes>

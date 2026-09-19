@@ -104,7 +104,7 @@ npm run dev
 
 - آدرس: http://127.0.0.1:3000 (طبق `vite.config.ts` پورت `3000` است، نه ۵۱۷۳)
 - اتصال به بک‌اند از `web/.env` خوانده می‌شود: `VITE_API_BASE=http://127.0.0.1:8000/api/v1`
-- تست build: `npm run build` (باید ۱۶۸ ماژول را بدون خطا بیلد کند)
+- تست build: `npm run build` (باید بدون خطا بیلد کند؛ آخرین بیلد موفق: ۱۷۶ ماژول)
 
 ---
 
@@ -210,7 +210,7 @@ const CryptoJS = require('crypto-js')   // ❌ در مرورگر وجود ندا
 
 ### ۷.۳ فرانت‌اند (`web/src/features/DashboardPage.tsx` + `web/src/hooks/useDashboard.ts`)
 - کارت‌های آمار، فهرست اهداف با نوار پیشرفت + فرم ایجاد سریع، صندوق ورودی با دکمه تأیید/رد، وظایف باز، گروه‌ها (با نشان مدیر) و اتاق‌های چت
-- مسیر `/dashboard` در `App.tsx` به `DashboardPage` واقعی وصل شد (چت و صندوق فعلاً Placeholder‌اند)
+- همه مسیرها در `App.tsx` به صفحه‌های واقعی وصل شدند: `/dashboard` (داشبورد)، `/chat`، `/inbox`، `/groups`، `/reports`، `/settings` — جزئیات در بخش ۸د
 - ⚠️ نکته فنی: هنگام نوشتن فایل، کاراکترهای CJK باعث دابل‌انکد شدن فارسی شدند؛ راه‌حل مطمئن: متن فارسی خالص سالم منتقل می‌شود (مثل `useDashboard.ts`) — از مخلوط‌کردن CJK در یک Write خودداری شود. باندل نهایی فارسی سالم دارد (تست شد).
 
 داده نمونه برای نمایش اولیه (کاربر `admin`): یک هدف «راه‌اندازی سامانه» (۷۰٪) و یک آیتم صندوق «بازبینی گزارش ماهانه».
@@ -275,6 +275,53 @@ const CryptoJS = require('crypto-js')   // ❌ در مرورگر وجود ندا
 - `web/src/api/client.ts`: ریترای با `transformRequest: [(d) => d]` بدنه اصلی را دست‌نخورده ارسال میکند + رفرش single-flight (`refreshPromise` مشترک) تا `401`های همزمان یک چرخش  مشترک داشته باشند.
 - چرخه تأییدشده: POST با توکن قدیمی `401` → رفرش → تکرار POST با بایتهای اصلی → `201`.
 
+## ۸ج. بازنویسی سرویس‌های ماژول‌ها روی DDL واقعی (۱۹ سپتامبر ۲۰۲۶)
+
+### علت
+مدل‌های ORM در `app/modules/*/db/Models.py` از DDL مهاجرت عقب بودند (جدول بدون اسکیما، ستون‌های خیالی، PK با تایپ اشتباه)؛ در نتیجه **همه endpointهای ماژول‌ها 500** می‌دادند (`/groups/`، `/goals/`، `/chat/rooms`، `/inbox/*`، `/sharing/*`، `/reporting/layouts`، `/reporting/widgets/settings`).
+
+### تصمیم
+به‌جای ترمیم مدل‌ها، لایه سرویس هر ۷ ماژول با **SQL خام schema-qualified** روی DDL واقعی بازنویسی شد (همان الگوی اثبات‌شده `reporting/api/dashboard.py`):
+- `rbac/services/rbac_service.py` (اسکیما `rbac` + گاردهای anti-escalation: ممنوعیت self-assign و اعطای نقش هم‌سطح/بالاتر + بررسی مدیر گروه برای scope فراتر از global)
+- `groups/services/groups_service.py` (اسکیما `groups`؛ ستون `path` از نوع ltree با uuid بدون خط‌تیره)
+- `goals/services/goals_service.py` (اسکیما `planning`)
+- `chat/services/chat_service.py` (اسکیما `chat`)
+- `inbox/services/inbox_service.py` (اسکیما `inbox`؛ `InboxService = InboxStateMachine`)
+- `sharing/services/sharing_service.py` (اسکیما `sharing`)
+- `reporting/services/reporting_service.py` (اسکیما `reporting`)
+
+اصلاحات پشتیبان: `rbac/ports.py` (فیلد `target_user_id` در Assign/Revoke)، `rbac/api/routes.py` (استفاده از `target_user_id` به‌جای self)، `sharing/api/routes.py` (`Body(..., embed=True)` برای revoke)، امضای `act_on_item(item_id, action, note, actor_id)` هماهنگ با route.
+
+### یافته‌های DDL (مهم برای توسعه بعدی)
+- `sharing.effective_permissions` یک **VIEW** است — فقط خواندنی؛ INSERT/UPDATE روی آن 500 می‌دهد.
+- ایندکس یکتای `dashboard_layouts` **جزئی** است (`WHERE is_default = true`) پس `ON CONFLICT` نامعتبر است → upsert دستی SELECT→INSERT/UPDATE.
+- پارامترهای jsonb در asyncpg باید **رشته JSON** باشند نه dict (`json.dumps`).
+- نوع enum بدون پیشوند اسکیما است (`privacy_level` نه `planning.privacy_level`).
+- `get_current_user` در `app/core/dependencies.py` **رشته** برمی‌گرداند (`str(user.id)`) نه UUID.
+- جدول `sharing.shares` ستون `share_code` ندارد (id همان share_code است) و constraint یکتایی روی سه‌گانه ندارد → upsert دستی.
+
+### Seed داده RBAC (یک‌بار اجرا شد)
+۵ نقش (`super_admin=10`، `admin=8`، `manager=5`، `user=3`، `viewer=1`) + ۲۴ دسترسی + نگاشت نقش‌ها (super_admin هر ۲۴؛ admin بدون `rbac.manage/ldap.configure`؛ manager ۱۴؛ user ۹؛ viewer ۵) + اعطای `super_admin` به کاربر `admin`. (اسکریپت موقت در `%TEMP%\opencode\seed_rbac.sql` — برای دیتابیس تازه دوباره اجرا شود.)
+
+### چرخه تأییدشده
+- `smoke.py`: هر ۱۸ endpoint خواندنی 200 ✅
+- `smoke2.py` (مسیر کامل نوشتن): ساخت گروه/هدف/تسک/اتاق/پیام/آیتم صندوق/اشتراک‌گذاری/چیدمان/ویجت + act/revoke — همگی 200 ✅ (اسکریپت‌ها در `%TEMP%\opencode\`)
+- توجه: `POST /rbac/assign` با `target_user_id` برابر خودِ کاربر 403 می‌دهد (`CANNOT_SELF_ASSIGN`) — رفتار درست است، نه باگ.
+
+---
+
+## ۸د. صفحات واقعی فرانت‌اند (۱۹ سپتامبر ۲۰۲۶)
+
+هر ۵ Placeholder در `App.tsx` با صفحه واقعی جایگزین شد (همان سیستم دیزاین بخش ۸: `.card/.btn-primary/.badge/.input`، آیکون SVG، RTL، انیمیشن‌ها):
+- `web/src/features/ChatPage.tsx` (`/chat`) — فهرست اتاق‌ها + ساخت اتاق + پیام‌ها با polling هر ۴ ثانیه + ارسال پیام
+- `web/src/features/InboxPage.tsx` (`/inbox`) — تب‌های ورودی/ارسال‌شده/آیتم جدید؛ تأیید/رد/تعویق؛ ساخت آیتم (`meeting_invite/share_request/task_assignment/chat_invite/approval`)
+- `web/src/features/GroupsPage.tsx` (`/groups`) — فهرست گروه‌ها + ساخت گروه + اعضای گروه + افزودن عضو (توسط مدیر گروه)
+- `web/src/features/ReportsPage.tsx` (`/reports`) — فهرست/ذخیره چیدمان داشبورد + تنظیمات ویجت‌ها (toggle + ذخیره + بازگشت به پیش‌فرض)
+- `web/src/features/SettingsPage.tsx` (`/settings`) — پروفایل کاربر + نقش‌ها (`GET /rbac/user/{id}/roles`) + شمار دسترسی‌ها + خروج
+- تأیید: `npm run build` موفق (۱۷۶ ماژول) و هر ۵ مسیر API در باندل نهایی موجود است؛ فارسی باندل سالم.
+
+---
+
 ## ۸. چرخه‌های تأییدشده (تست end-to-end روی سرور در حال اجرا)
 
 ```
@@ -290,9 +337,9 @@ REGISTER 201 → LOGIN 200 (access+refresh token) → ME 200 (کد ملی ماس
 |---|---|---|
 | MFA کامل (TOTP) | ❌ استاب خالی (`auth/db/mfa.py`) | متدهای `generate_mfa_token/verify_token/enroll` وجود ندارند؛ چون کاربران جدید `mfa_enabled=False` دارند ورود عادی کار می‌کند. پیاده‌سازی TOTP نیازمند `pyotp` وフロ کامل enroll/verify است |
 | ۵ ماژول stub | ❌ اسکلت | `calendar, notification, audit, ssoldap, files` فقط router نمونه دارند؛ اسکیمای SQL آن‌ها آماده است |
-| دریفت ORM از DDL | ⚠️ بدهی فنی | مدل‌های `goals/groups/chat/inbox/reporting/sharing` اسکیما و ستون درست ندارند؛ داشبورد با SQL خام دورشان زده. رفع اصولی: هم‌راستاسازی مدل‌ها با DDL + اعلام `schema` در هر مدل (ADR-04) |
+| دریفت ORM از DDL | ✅ دور زده شد | سرویس‌های هر ۷ ماژول با SQL خام روی DDL واقعی بازنویسی شدند (بخش ۸ج)؛ مدل‌های ORM منحرف هنوز در `db/Models.py` هستند و استفاده نمی‌شوند — حذف/بازنگری آتی |
 | Redis | ❌ نصب نیست | لازم نیست: rate-limit حافظه‌ای و WebSocket حافظه‌ای است؛ برای چند Worker طبق سند معماری Redis لازم می‌شود |
-| نقش‌های کاربر `admin` | ⚠️ بدون نقش | کاربر `admin` ساخته‌شده `roles: []` دارد؛ اعطای نقش مدیریتی به‌زودی باید از مسیر RBAC انجام شود |
+| نقش‌های کاربر `admin` | ✅ انجام شد | seed RBAC (بخش ۸ج): ۵ نقش + ۲۴ دسترسی + اعطای `super_admin` به `admin` |
 | باطل‌شدن نشست‌های قبلی با هر login | ⚠️ رفتار فعلی | به‌خاطر `token_version++` در صدور توکن، ورود جدید نشست‌های قبلی را می‌اندازد؛ اگر چنددستگاهی می‌خواهید بازبینی شود |
 
 ---
