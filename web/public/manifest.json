@@ -1,0 +1,18 @@
+{
+  "short_name": "Planner",
+  "name": "سامانه مدیریت اهداف سازمانی",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "type": "image/svg+xml",
+      "sizes": "any",
+      "purpose": "any maskable"
+    }
+  ],
+  "start_url": "/",
+  "display": "standalone",
+  "theme_color": "#1a202c",
+  "background_color": "#f8f9fa",
+  "orientation": "portrait",
+  "description": "سامانه سازمانی مدیریت اهداف، برنامه‌ریزی و همکاری"
+}

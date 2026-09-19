@@ -1,0 +1,112 @@
+/* Light Theme - Planner Desktop */
+QWidget {
+    font-family: 'Vazirmatn', sans-serif;
+    font-size: 11pt;
+    color: #212529;
+    background-color: #f8f9fa;
+}
+
+QMainWindow {
+    background-color: #f8f9fa;
+}
+
+QFrame#dashboard_frame {
+    background-color: #f8f9fa;
+    border-radius: 8px;
+}
+
+QLabel {
+    color: #212529;
+    font-family: 'Vazirmatn';
+}
+
+QPushButton {
+    font-family: 'Vazirmatn';
+    font-size: 10pt;
+    border-radius: 4px;
+    padding: 6px 12px;
+    background-color: #e9ecef;
+    border: 1px solid #ced4da;
+    color: #495057;
+}
+
+QPushButton:hover {
+    background-color: #dee2e6;
+}
+
+QPushButton:pressed {
+    background-color: #d6d8dc;
+}
+
+QPushButton#primary {
+    background-color: #2d3748;
+    color: white;
+    border: none;
+}
+
+QPushButton#primary:hover {
+    background-color: #4a5568;
+}
+
+QPushButton#success {
+    background-color: #48bb78;
+    color: white;
+    border: none;
+}
+
+QPushButton#success:hover {
+    background-color: #38a569;
+}
+
+QProgressBar {
+    border: none;
+    background-color: #edf2f7;
+    border-radius: 4px;
+    height: 8px;
+}
+
+QProgressBar::chunk {
+    background-color: #48bb78;
+    border-radius: 4px;
+}
+
+QSizeGrip {
+    width: 16px;
+    height: 16px;
+}
+
+/* Clock widget specific */
+QLabel#time_label {
+    font-size: 48px;
+    font-weight: bold;
+    color: #edf2f7;
+}
+
+QLabel.jalali_label {
+    font-size: 14px;
+    color: #787878;
+    margin-top: 4px;
+}
+
+QLabel.greg_label {
+    font-size: 12px;
+    color: #787878;
+    margin-top: 2px;
+}
+
+/* Goals progress widget */
+QProgressBar#overall_progress {
+    height: 8px;
+    border: none;
+    background-color: #edf2f7;
+}
+
+QProgressBar#overall_progress::chunk {
+    background-color: #48bb78;
+    border-radius: 4px;
+}
+
+/* Quick actions */
+QGridLayout {
+    spacing: 10px;
+}
