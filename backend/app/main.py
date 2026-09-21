@@ -5,68 +5,60 @@ Architecture: Modular Monolith with Defense in Depth
 Version: 2.0
 """
 
+import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import JSONResponse
+
 import uvicorn
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 from app.core.config import settings
-from app.core.middleware import register_middlewares
+from app.core.database import dispose_engine, engine
 from app.core.errors import register_exception_handlers
 from app.core.events import event_bus
+from app.core.middleware import register_middlewares
 from app.modules import auth, rbac, groups, goals, sharing, chat, inbox, \
                         reporting, notification, audit, ssoldap, files
+
+logging.basicConfig(level=settings.LOG_LEVEL, format=settings.LOG_FORMAT)
 
 # Module order matters for initialization
 MODULES = [auth, rbac, groups, goals, sharing,
            chat, inbox, reporting, notification, audit, ssoldap, files]
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
-    # Initialize event bus subscriptions (modules without handlers are skipped)
+    # Event bus subscriptions (modules without handlers are skipped)
     for m in MODULES:
         register = getattr(m, "register_event_handlers", None)
         if callable(register):
             register(event_bus)
 
-    # Startup checks
     yield
 
-    # Shutdown gracefully
+    # Graceful shutdown: return pooled connections to PostgreSQL
     await shutdown_gracefully()
 
+
+_docs_enabled = not settings.is_production
+
 app = FastAPI(
-    title="Planner Enterprise API",
-    version="1.0.0",
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
     lifespan=lifespan,
-    docs_url="/docs" if settings.ENV != "production" else None,
-    redoc_url="/redoc" if settings.ENV != "production" else None,
-    openapi_url="/openapi.json" if settings.ENV != "production" else None,
+    root_path=settings.ROOT_PATH,
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
 )
 
-# --- Security Middleware ---
-# Order matters: first line of defense
-app.add_middleware(
-    TrustedHostMiddleware,
-    allowed_hosts=settings.ALLOWED_HOSTS
-)
-
-# CORS - Configure based on environment
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- Register Middlewares (Request Processing Chain) ---
+# --- Middleware chain (single place; order documented in core/middleware) ---
 register_middlewares(app)
 
-# --- Register Exception Handlers ---
+# --- Exception handlers ---
 register_exception_handlers(app)
 
 # --- Include Module Routers ---
@@ -80,26 +72,38 @@ for m in MODULES:
 
 async def shutdown_gracefully():
     """Graceful shutdown routine."""
-    # Close DB connections, Redis, etc.
-    # Would integrate with actual services here
-    pass
+    await dispose_engine()
 
-# Health check endpoint
+
+# Liveness: process is up (no dependencies touched)
 @app.get("/health", include_in_schema=False)
 async def health_check():
     return {
         "status": "healthy",
         "service": "planner-enterprise-api",
-        "version": "1.0.0",
-        "modules": [m.__name__ for m in MODULES]
+        "version": settings.APP_VERSION,
+        "modules": [m.__name__ for m in MODULES],
     }
+
+
+# Readiness: dependencies reachable (used by the load balancer)
+@app.get("/ready", include_in_schema=False)
+async def readiness_check():
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+    except Exception:
+        logging.getLogger("app.health").exception("readiness: database unreachable")
+        return JSONResponse(status_code=503, content={"status": "unavailable", "database": "down"})
+    return {"status": "ready", "database": "up"}
+
 
 # Root endpoint
 @app.get("/", include_in_schema=False)
 async def root():
     return {
         "message": "Planner Enterprise API",
-        "version": "1.0.0",
+        "version": settings.APP_VERSION,
         "docs": "/docs" if settings.ENV != "production" else "disabled",
         "endpoints": "/api/v1/auth, /api/v1/goals, /api/v1/groups, etc."
     }
@@ -107,8 +111,8 @@ async def root():
 if __name__ == "__main__":
     uvicorn.run(
         "app.main:app",
-        host="0.0.0.0",
-        port=8000,
+        host=settings.HOST,
+        port=settings.PORT,
         reload=settings.ENV == "development",
         access_log=False
     )

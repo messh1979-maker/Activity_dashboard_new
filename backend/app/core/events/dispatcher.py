@@ -1,34 +1,21 @@
 """
 app/core/events/dispatcher.py
 
-Dispatcher برای ردیف‌های Outbox که باید به مصرف‌کننده‌های **خارج از
-فرآیند** تحویل داده شوند (مثل Celery workers برای Email/Push/Export —
-نه Audit، که همان‌طور که در bus.py توضیح داده شد، درون‌پروسه و هم‌تراکنش
-مصرف می‌شود).
+Dispatcher ردیف‌های Outbox برای مصرف‌کننده‌های «بعد از commit»
+(``subscribe(..., transactional=False)``) — مثل Notification/Push/Email.
+handlerهای هم‌تراکنش (Audit) اینجا **اجرا نمی‌شوند** (قبلاً دوباره اجرا
+می‌شدند و ردیف تکراری می‌ساختند).
 
-طبق ساختار پوشه‌ی سند (بخش ۳.۱)، این تابع باید توسط یک تسک دوره‌ای
-Celery در ``workers/tasks/outbox_dispatcher.py`` فراخوانی شود، مثلاً
-هر چند ثانیه یک‌بار:
+طبق سند (بخش ۳.۱) باید توسط تسک دوره‌ای Celery
+(``workers/tasks/outbox_dispatcher.py``) فراخوانی شود.
 
-    # app/workers/tasks/outbox_dispatcher.py
-    from app.workers.celery_app import celery_app
-    from app.core.events.dispatcher import dispatch_pending_outbox_messages
-
-    @celery_app.task
-    def dispatch_outbox():
-        import asyncio
-        asyncio.run(dispatch_pending_outbox_messages())
-
-⚠️ این پیاده‌سازی یک **نقطه‌ی شروع حداقلی** است، نه نسخه‌ی نهایی تولید:
-- تحویل واقعی به مصرف‌کننده‌های خارج از فرآیند (مثلاً صف Celery جداگانه
-  به‌ازای هر نوع رویداد) هنوز باید اضافه شود؛ فعلاً فقط handlerهای
-  درون‌پروسه‌ی ثبت‌شده روی همان ``event_bus`` را دوباره صدا می‌زند (برای
-  مواردی که هنگام publish اصلی، به هر دلیل consumer در آن لحظه در
-  حافظه نبوده — سناریوی راه‌اندازی مجدد سرویس).
-- قفل توزیع‌شده (مثلاً Redis lock) برای جلوگیری از پردازش هم‌زمان یک
-  ردیف توسط چند Worker اضافه نشده — برای تک-Worker فعلاً کافی است.
+* ``FOR UPDATE SKIP LOCKED`` — چند Worker همزمان روی یک ردیف کار نمی‌کنند.
+* هر ردیف در یک SAVEPOINT پردازش می‌شود؛ خطای یک ردیف تراکنش ردیف‌های
+  دیگر را خراب نمی‌کند.
+* ردیفی که مصرف‌کننده‌ی async ندارد، بلافاصله dispatched علامت می‌خورد.
+* بعد از ``MAX_ATTEMPTS`` شکست، ردیف رها می‌شود (با ``last_error``) تا
+  دستی بررسی شود (dead-letter).
 """
-
 from __future__ import annotations
 
 import logging
@@ -45,42 +32,36 @@ MAX_ATTEMPTS = 5
 
 
 async def dispatch_pending_outbox_messages(session, batch_size: int = 100) -> int:
-    """ردیف‌های dispatched_at IS NULL را پردازش و علامت‌گذاری می‌کند.
-
-    ``session`` یک AsyncSession جدا از تراکنش publish اصلی است (این
-    تابع در Worker جدا اجرا می‌شود). عدد ردیف‌های پردازش‌شده را برمی‌گرداند.
-    """
-    result = await session.execute(
+    """Process pending rows; returns the number successfully dispatched."""
+    rows = (await session.execute(
         select(OutboxMessage)
         .where(OutboxMessage.dispatched_at.is_(None))
         .where(OutboxMessage.attempts < MAX_ATTEMPTS)
-        .order_by(OutboxMessage.created_at)
+        .order_by(OutboxMessage.id)
         .limit(batch_size)
-        .with_for_update(skip_locked=True)  # چند Worker هم‌زمان ایمن باشند
-    )
-    rows = result.scalars().all()
+        .with_for_update(skip_locked=True)
+    )).scalars().all()
 
     processed = 0
     for row in rows:
         event = DomainEvent(
-            event_type=row.event_type,
-            payload=row.payload,
-            event_id=row.event_id,
-            correlation_id=row.correlation_id,
+            event_type=row.event_type, payload=row.payload,
+            event_id=row.event_id, correlation_id=row.correlation_id,
+            occurred_at=row.created_at,
         )
+        handlers = event_bus.handlers_for(event.event_type, transactional=False)
         try:
-            handlers = event_bus._handlers.get(event.event_type, [])  # noqa: SLF001
-            for handler in handlers:
-                await handler(event, session)
+            async with session.begin_nested():  # SAVEPOINT
+                for handler in handlers:
+                    await handler(event, session)
             row.dispatched_at = datetime.now(timezone.utc)
+            row.last_error = None
             processed += 1
         except Exception as exc:  # noqa: BLE001
-            row.attempts += 1
+            row.attempts = (row.attempts or 0) + 1
             row.last_error = str(exc)[:2000]
-            logger.exception(
-                "outbox dispatch failed for event_id=%s (attempt %s/%s)",
-                row.event_id, row.attempts, MAX_ATTEMPTS,
-            )
+            logger.exception("outbox dispatch failed for event_id=%s (attempt %s/%s)",
+                             row.event_id, row.attempts, MAX_ATTEMPTS)
 
     await session.commit()
     return processed

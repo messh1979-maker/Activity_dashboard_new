@@ -120,6 +120,9 @@ async def get_current_user(
                 detail="Token revoked",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        # Later audit rows / events of this request carry the actor
+        from app.core.context import bind_user
+        bind_user(user.id)
         return str(user.id)
 
 
@@ -130,10 +133,12 @@ def check_rate_limit(
     limit: int = 100,
     window_seconds: int = 60
 ) -> bool:
-    """Check if request is within rate limits.
-    Simplified implementation - real one uses Redis.
+    """Deprecated no-op kept for import compatibility.
+
+    Rate limiting is enforced globally by ``RateLimitMiddleware``
+    (settings ``RATE_LIMIT_DEFAULT`` / ``RATE_LIMIT_AUTH``); do not rely on
+    this dependency for protection.
     """
-    # Placeholder - always returns True
     return True
 
 

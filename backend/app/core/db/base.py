@@ -1,12 +1,11 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TypeVar, Generic, Optional, List
 from sqlalchemy import (
     Column, Integer, String, DateTime, Boolean, Text, 
     JSON, func, Index, CheckConstraint
 )
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import declared_attr
+from sqlalchemy.orm import declarative_base, declared_attr
 from sqlalchemy.sql import expression
 
 Base = declarative_base()
@@ -55,7 +54,7 @@ class BaseModel(Base):
     
     def soft_delete(self):
         """Mark record as deleted instead of hard delete."""
-        self.deleted_at = datetime.utcnow()
+        self.deleted_at = datetime.now(timezone.utc)
     
     def is_deleted(self) -> bool:
         """Check if record is soft-deleted."""
@@ -78,7 +77,7 @@ class BaseModel(Base):
     
     def update_timestamp(self):
         """Update the updated_at timestamp."""
-        self.updated_at = datetime.utcnow()
+        self.updated_at = datetime.now(timezone.utc)
 
 
 # Mixin for audit tracking
@@ -108,7 +107,7 @@ class DatabaseUtils:
     @staticmethod
     def current_timestamp() -> datetime:
         """Get current UTC timestamp."""
-        return datetime.utcnow()
+        return datetime.now(timezone.utc)
     
     @staticmethod
     def paginate_query(query, page: int = 1, size: int = 20):

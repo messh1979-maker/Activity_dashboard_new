@@ -46,6 +46,12 @@ CREATE TABLE audit.audit_logs_2026_09 PARTITION OF audit.audit_logs
 CREATE TABLE audit.audit_logs_2026_10 PARTITION OF audit.audit_logs
     FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
 
+-- Safety net: without a DEFAULT partition every INSERT after the last dated
+-- partition fails and login/audit writes (same transaction as the business
+-- operation) would take the whole request down. The audit_archive worker
+-- creates the next monthly partitions ahead of time (architecture 3.1).
+CREATE TABLE audit.audit_logs_default PARTITION OF audit.audit_logs DEFAULT;
+
 -- Indexes for audit queries
 CREATE INDEX idx_audit_user_time ON audit.audit_logs(user_id, timestamp DESC);
 CREATE INDEX idx_audit_mac ON audit.audit_logs(mac_address) WHERE mac_address IS NOT NULL;
@@ -70,7 +76,7 @@ CREATE TABLE audit.login_audit_logs (
     device_is_trusted BOOLEAN,
     user_agent TEXT,
     success BOOLEAN NOT NULL,
-    failure_reason VARCHAR(100), -- Internal code, not user-facing message
+    failure_reason VARCHAR(255), -- Internal code, not user-facing message
     session_id UUID,
     geo_location JSONB,
     risk_score SMALLINT, -- 0-100, for anomaly detection
@@ -85,58 +91,50 @@ CREATE INDEX idx_login_audit_mac ON audit.login_audit_logs(mac_address);
 CREATE INDEX idx_login_audit_ip ON audit.login_audit_logs(ip_address, timestamp DESC);
 CREATE INDEX idx_login_failed ON audit.login_audit_logs(username, timestamp DESC) WHERE success = FALSE;
 
--- Hash Chain Function (Trigger)
-CREATE OR REPLACE FUNCTION audit.compute_row_hash() RETURNS TRIGGER AS $$
-DECLARE
-    material TEXT;
+-- ------------------------------------------------------------
+-- Hash chain: computed by the application (AuditService) inside the same
+-- transaction as the business operation, under an advisory lock, exactly as
+-- architecture 4.8 / 12.3 specify. (A DB trigger that recomputes row_hash
+-- would overwrite the app's value with a different formula and break
+-- verification, so none is installed.)
+-- ------------------------------------------------------------
+
+-- Append-only enforcement (ADR-10): UPDATE / DELETE / TRUNCATE are rejected
+-- for every role, including the table owner. Retention is done by
+-- DETACH PARTITION, which is DDL and unaffected.
+CREATE OR REPLACE FUNCTION audit.forbid_mutation() RETURNS TRIGGER AS $$
 BEGIN
-    material := '|' || 
-        COALESCE(NEW.prev_hash, 'GENESIS') || '|' ||
-        COALESCE(NEW.user_id::text, '') || '|' ||
-        COALESCE(NEW.action, '') || '|' ||
-        TO_CHAR(NEW.timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') || '|' ||
-        COALESCE(NEW.ip_address::text, '') || '|' ||
-        COALESCE(NEW.mac_address, '') || '|' ||
-        COALESCE(NEW.result, '') || '|' ||
-        COALESCE(NEW.details::text, '') ||
-        '|' || COALESCE(NEW.old_value::text, '') || '|' || COALESCE(NEW.new_value::text, '');
-    
-    NEW.row_hash := ENCODE(DIGEST(material, 'sha256'), 'hex');
-    NEW.prev_hash := COALESCE((SELECT row_hash FROM audit.audit_logs ORDER BY id DESC LIMIT 1), 'GENESIS');
-    
-    RETURN NEW;
+    RAISE EXCEPTION 'audit tables are append-only (% on %.% rejected)',
+        TG_OP, TG_TABLE_SCHEMA, TG_TABLE_NAME
+        USING ERRCODE = 'insufficient_privilege';
 END;
 $$ LANGUAGE plpgsql;
 
--- Apply trigger to audit_logs
-CREATE TRIGGER trg_audit_row_hash
-BEFORE INSERT ON audit.audit_logs
-FOR EACH ROW EXECUTE FUNCTION audit.compute_row_hash();
+CREATE TRIGGER trg_audit_logs_append_only
+BEFORE UPDATE OR DELETE ON audit.audit_logs
+FOR EACH ROW EXECUTE FUNCTION audit.forbid_mutation();
 
--- Same trigger for login_audit_logs
-CREATE TRIGGER trg_login_audit_row_hash
-BEFORE INSERT ON audit.login_audit_logs
-FOR EACH ROW EXECUTE FUNCTION audit.compute_row_hash();
+CREATE TRIGGER trg_audit_logs_no_truncate
+BEFORE TRUNCATE ON audit.audit_logs
+FOR EACH STATEMENT EXECUTE FUNCTION audit.forbid_mutation();
 
--- Integrity Check Function (Daily job)
-CREATE OR REPLACE FUNCTION audit.check_integrity() RETURNS VOID AS $$
-DECLARE
-    rec RECORD;
-    expected_hash CHAR(64);
+CREATE TRIGGER trg_login_audit_append_only
+BEFORE UPDATE OR DELETE ON audit.login_audit_logs
+FOR EACH ROW EXECUTE FUNCTION audit.forbid_mutation();
+
+CREATE TRIGGER trg_login_audit_no_truncate
+BEFORE TRUNCATE ON audit.login_audit_logs
+FOR EACH STATEMENT EXECUTE FUNCTION audit.forbid_mutation();
+
+-- Least privilege for the application role (only when that role exists;
+-- an unconditional REVOKE/GRANT aborts the whole migration on a fresh DB).
+DO $$
 BEGIN
-    FOR rec IN SELECT id, prev_hash, row_hash FROM audit.audit_logs ORDER BY id LOOP
-        -- Verify chain link
-        IF rec.prev_hash != (
-            SELECT row_hash FROM audit.audit_logs WHERE id = rec.id - 1
-        ) THEN
-            -- Chain broken - raise notice
-            RAISE NOTICE 'Audit chain broken at log ID %', rec.id;
-        END IF;
-    END LOOP;
-END;
-$$ LANGUAGE plpgsql;
-
--- Policy: Restrict app_user to only INSERT/SELECT
-REVOKE ALL ON ALL TABLES IN SCHEMA audit FROM app_user;
-GRANT INSERT, SELECT ON ALL TABLES IN SCHEMA audit TO app_user;
-GRANT EXECUTE ON FUNCTION audit.compute_row_hash TO app_user;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_user') THEN
+        REVOKE UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA audit FROM app_user;
+        GRANT USAGE ON SCHEMA audit TO app_user;
+        GRANT INSERT, SELECT ON ALL TABLES IN SCHEMA audit TO app_user;
+        GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA audit TO app_user;
+    END IF;
+END
+$$;

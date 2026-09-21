@@ -1,0 +1,2667 @@
+diff --git a/backend/.env.example b/backend/.env.example
+index 59784b4..b665b79 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -1,5 +1,6 @@
+-ENV=development
+-DEBUG=True
++ENV=development            # development | testing | production
++DEBUG=False
++SQL_ECHO=False             # log every SQL statement (very noisy)
+ # At least 32 characters. Generate with:
+ #   .\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(32))"
+ SECRET_KEY=change-me-to-a-random-string-at-least-32-chars-long
+@@ -22,3 +23,22 @@ ENABLE_AUDIT_LOGGING=True
+ RATE_LIMIT_DEFAULT=100/minute
+ RATE_LIMIT_AUTH=10/minute
+ MAX_UPLOAD_SIZE=52428800
++
++# ---- Added in architecture-v2 infrastructure pass -------------------------
++# Separate keys per purpose (section 4.9 / ADR-06). REQUIRED when ENV=production.
++#   DATA_ENCRYPTION_KEY: python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"
++#   NATIONAL_ID_PEPPER : python -c "import secrets;print(secrets.token_urlsafe(48))"
++DATA_ENCRYPTION_KEY=
++NATIONAL_ID_PEPPER=
++# HS256 by default; for RS256 set ALGORITHM=RS256 plus both PEM keys.
++ALGORITHM=HS256
++# JSON arrays. '*' is rejected in production.
++ALLOWED_HOSTS=["*"]
++ALLOWED_ORIGINS=[]         # WebSocket Origin allow-list; empty = CORS_ORIGINS
++TRUSTED_PROXIES=[]         # only these peers may set X-Forwarded-For
++IP_ALLOW_LIST=[]
++IP_DENY_LIST=[]
++MAX_BODY_SIZE=1048576
++RATE_LIMIT_ENABLED=True
++ALLOW_SELF_REGISTRATION=False
++DEVICE_BINDING_MODE=observe  # off | observe | enforce
+diff --git a/backend/alembic/versions/audit_schema.sql b/backend/alembic/versions/audit_schema.sql
+index 1dfe811..5bcee6b 100644
+--- a/backend/alembic/versions/audit_schema.sql
++++ b/backend/alembic/versions/audit_schema.sql
+@@ -46,6 +46,12 @@ CREATE TABLE audit.audit_logs_2026_09 PARTITION OF audit.audit_logs
+ CREATE TABLE audit.audit_logs_2026_10 PARTITION OF audit.audit_logs
+     FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+ 
++-- Safety net: without a DEFAULT partition every INSERT after the last dated
++-- partition fails and login/audit writes (same transaction as the business
++-- operation) would take the whole request down. The audit_archive worker
++-- creates the next monthly partitions ahead of time (architecture 3.1).
++CREATE TABLE audit.audit_logs_default PARTITION OF audit.audit_logs DEFAULT;
++
+ -- Indexes for audit queries
+ CREATE INDEX idx_audit_user_time ON audit.audit_logs(user_id, timestamp DESC);
+ CREATE INDEX idx_audit_mac ON audit.audit_logs(mac_address) WHERE mac_address IS NOT NULL;
+@@ -70,7 +76,7 @@ CREATE TABLE audit.login_audit_logs (
+     device_is_trusted BOOLEAN,
+     user_agent TEXT,
+     success BOOLEAN NOT NULL,
+-    failure_reason VARCHAR(100), -- Internal code, not user-facing message
++    failure_reason VARCHAR(255), -- Internal code, not user-facing message
+     session_id UUID,
+     geo_location JSONB,
+     risk_score SMALLINT, -- 0-100, for anomaly detection
+@@ -85,58 +91,50 @@ CREATE INDEX idx_login_audit_mac ON audit.login_audit_logs(mac_address);
+ CREATE INDEX idx_login_audit_ip ON audit.login_audit_logs(ip_address, timestamp DESC);
+ CREATE INDEX idx_login_failed ON audit.login_audit_logs(username, timestamp DESC) WHERE success = FALSE;
+ 
+--- Hash Chain Function (Trigger)
+-CREATE OR REPLACE FUNCTION audit.compute_row_hash() RETURNS TRIGGER AS $$
+-DECLARE
+-    material TEXT;
+-BEGIN
+-    material := '|' || 
+-        COALESCE(NEW.prev_hash, 'GENESIS') || '|' ||
+-        COALESCE(NEW.user_id::text, '') || '|' ||
+-        COALESCE(NEW.action, '') || '|' ||
+-        TO_CHAR(NEW.timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') || '|' ||
+-        COALESCE(NEW.ip_address::text, '') || '|' ||
+-        COALESCE(NEW.mac_address, '') || '|' ||
+-        COALESCE(NEW.result, '') || '|' ||
+-        COALESCE(NEW.details::text, '') ||
+-        '|' || COALESCE(NEW.old_value::text, '') || '|' || COALESCE(NEW.new_value::text, '');
+-    
+-    NEW.row_hash := ENCODE(DIGEST(material, 'sha256'), 'hex');
+-    NEW.prev_hash := COALESCE((SELECT row_hash FROM audit.audit_logs ORDER BY id DESC LIMIT 1), 'GENESIS');
+-    
+-    RETURN NEW;
+-END;
+-$$ LANGUAGE plpgsql;
++-- ------------------------------------------------------------
++-- Hash chain: computed by the application (AuditService) inside the same
++-- transaction as the business operation, under an advisory lock, exactly as
++-- architecture 4.8 / 12.3 specify. (A DB trigger that recomputes row_hash
++-- would overwrite the app's value with a different formula and break
++-- verification, so none is installed.)
++-- ------------------------------------------------------------
+ 
+--- Apply trigger to audit_logs
+-CREATE TRIGGER trg_audit_row_hash
+-BEFORE INSERT ON audit.audit_logs
+-FOR EACH ROW EXECUTE FUNCTION audit.compute_row_hash();
+-
+--- Same trigger for login_audit_logs
+-CREATE TRIGGER trg_login_audit_row_hash
+-BEFORE INSERT ON audit.login_audit_logs
+-FOR EACH ROW EXECUTE FUNCTION audit.compute_row_hash();
+-
+--- Integrity Check Function (Daily job)
+-CREATE OR REPLACE FUNCTION audit.check_integrity() RETURNS VOID AS $$
+-DECLARE
+-    rec RECORD;
+-    expected_hash CHAR(64);
++-- Append-only enforcement (ADR-10): UPDATE / DELETE / TRUNCATE are rejected
++-- for every role, including the table owner. Retention is done by
++-- DETACH PARTITION, which is DDL and unaffected.
++CREATE OR REPLACE FUNCTION audit.forbid_mutation() RETURNS TRIGGER AS $$
+ BEGIN
+-    FOR rec IN SELECT id, prev_hash, row_hash FROM audit.audit_logs ORDER BY id LOOP
+-        -- Verify chain link
+-        IF rec.prev_hash != (
+-            SELECT row_hash FROM audit.audit_logs WHERE id = rec.id - 1
+-        ) THEN
+-            -- Chain broken - raise notice
+-            RAISE NOTICE 'Audit chain broken at log ID %', rec.id;
+-        END IF;
+-    END LOOP;
++    RAISE EXCEPTION 'audit tables are append-only (% on %.% rejected)',
++        TG_OP, TG_TABLE_SCHEMA, TG_TABLE_NAME
++        USING ERRCODE = 'insufficient_privilege';
+ END;
+ $$ LANGUAGE plpgsql;
+ 
+--- Policy: Restrict app_user to only INSERT/SELECT
+-REVOKE ALL ON ALL TABLES IN SCHEMA audit FROM app_user;
+-GRANT INSERT, SELECT ON ALL TABLES IN SCHEMA audit TO app_user;
+-GRANT EXECUTE ON FUNCTION audit.compute_row_hash TO app_user;
+\ No newline at end of file
++CREATE TRIGGER trg_audit_logs_append_only
++BEFORE UPDATE OR DELETE ON audit.audit_logs
++FOR EACH ROW EXECUTE FUNCTION audit.forbid_mutation();
++
++CREATE TRIGGER trg_audit_logs_no_truncate
++BEFORE TRUNCATE ON audit.audit_logs
++FOR EACH STATEMENT EXECUTE FUNCTION audit.forbid_mutation();
++
++CREATE TRIGGER trg_login_audit_append_only
++BEFORE UPDATE OR DELETE ON audit.login_audit_logs
++FOR EACH ROW EXECUTE FUNCTION audit.forbid_mutation();
++
++CREATE TRIGGER trg_login_audit_no_truncate
++BEFORE TRUNCATE ON audit.login_audit_logs
++FOR EACH STATEMENT EXECUTE FUNCTION audit.forbid_mutation();
++
++-- Least privilege for the application role (only when that role exists;
++-- an unconditional REVOKE/GRANT aborts the whole migration on a fresh DB).
++DO $$
++BEGIN
++    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_user') THEN
++        REVOKE UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA audit FROM app_user;
++        GRANT USAGE ON SCHEMA audit TO app_user;
++        GRANT INSERT, SELECT ON ALL TABLES IN SCHEMA audit TO app_user;
++        GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA audit TO app_user;
++    END IF;
++END
++$$;
+diff --git a/backend/app/core/config.py b/backend/app/core/config.py
+index 912ba19..943e0f7 100644
+--- a/backend/app/core/config.py
++++ b/backend/app/core/config.py
+@@ -1,115 +1,187 @@
+-import os
++"""Application configuration (Pydantic Settings, loaded from ENV / .env).
++
++Architecture v2.0: section 3.1 (core/config.py) and 13.5 (deployment hardening).
++
++Validation happens *inside* the model. (The previous version declared the
++``@field_validator`` functions at module level, so they were never applied and
++a weak ``SECRET_KEY`` / empty password was silently accepted.)
++"""
++from __future__ import annotations
++
+ from pathlib import Path
+-from pydantic import AliasChoices, Field, PostgresDsn, field_validator
++from typing import List
++
++from pydantic import AliasChoices, Field, PostgresDsn, field_validator, model_validator
+ from pydantic_settings import BaseSettings, SettingsConfigDict
+-from typing import List, Optional
++
++_INSECURE_SECRETS = {
++    "change-me-to-a-random-string-at-least-32-chars-long",
++    "changeme",
++    "secret",
++}
+ 
+ 
+ class Settings(BaseSettings):
+     """Application configuration from environment variables."""
+ 
+     model_config = SettingsConfigDict(
+-        # Use .env file if it exists
+         env_file=".env",
+         env_file_encoding="utf-8",
+-        # Case-insensitive env var names
+         case_sensitive=False,
++        extra="ignore",
+     )
+-    
+-    # Application
++
++    # ── Application
+     APP_NAME: str = "Planner Enterprise API"
+-    APP_VERSION: str = "1.0.0"
+-    ENV: str = Field(default="development", env="ENV")
+-    DEBUG: bool = Field(default=False, env="DEBUG")
+-    
+-    # Server
++    APP_VERSION: str = "2.0.0"
++    ENV: str = "development"  # development | testing | production
++    DEBUG: bool = False
++    SQL_ECHO: bool = False  # log every SQL statement (was tied to ENV before)
++
++    # ── Server
+     HOST: str = "0.0.0.0"
+     PORT: int = 8000
+-    
+-    # Security
+-    SECRET_KEY: str = Field(..., env="SECRET_KEY")  # 32+ bytes
+-    # HS256 with the shared SECRET_KEY (RS256 would need an RSA keypair)
++
++    # ── Security
++    SECRET_KEY: str = Field(..., min_length=32)
++    # HS256 (shared secret) by default; set both JWT_*_KEY for RS256 (ADR / 3.1).
+     ALGORITHM: str = "HS256"
++    JWT_PRIVATE_KEY: str | None = None
++    JWT_PUBLIC_KEY: str | None = None
+     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
+     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
+     PASSWORD_RESET_EXPIRE_MINUTES: int = 1440
+-    
+-    # Database
+-    POSTGRES_SERVER: str = Field(..., env="POSTGRES_SERVER")
+-    POSTGRES_PORT: int = Field(default=5432, env="POSTGRES_PORT")
+-    POSTGRES_USER: str = Field(..., env="POSTGRES_USER")
+-    POSTGRES_PASSWORD: str = Field(..., env="POSTGRES_PASSWORD")
+-    POSTGRES_DB: str = Field(..., env="POSTGRES_DB")
+-    # Accept both names: .env/app use SQLALCHEMY_DATABASE_URI,
+-    # some tooling expects DATABASE_URL.
++    # Separate keys per purpose (section 4.9). When unset they are derived from
++    # SECRET_KEY, which is acceptable for dev only (enforced in production).
++    DATA_ENCRYPTION_KEY: str | None = None   # base64, 32 bytes (AES-256-GCM)
++    NATIONAL_ID_PEPPER: str | None = None    # HMAC key for searchable hash
++
++    # ── Database
++    POSTGRES_SERVER: str = "localhost"
++    POSTGRES_PORT: int = 5432
++    POSTGRES_USER: str = ""
++    POSTGRES_PASSWORD: str = ""
++    POSTGRES_DB: str = ""
+     SQLALCHEMY_DATABASE_URI: PostgresDsn = Field(
+         ...,
+         validation_alias=AliasChoices("SQLALCHEMY_DATABASE_URI", "DATABASE_URL"),
+     )
+-    
+-    # Redis
++    DB_POOL_SIZE: int = 20
++    DB_MAX_OVERFLOW: int = 30
++
++    # ── Redis
+     REDIS_HOST: str = "localhost"
+     REDIS_PORT: int = 6379
+     REDIS_DB: int = 0
+-    
+-    # Security headers
++    REDIS_URL: str | None = None  # overrides host/port/db when set
++
++    # ── HTTP hardening
+     ALLOWED_HOSTS: List[str] = ["*"]
+     CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:8080"]
+-    
+-    # Feature flags
++    # WebSocket Origin allow-list (WebSocket is not covered by CORS, 12.8).
++    # Empty -> falls back to CORS_ORIGINS.
++    ALLOWED_ORIGINS: List[str] = []
++    TRUSTED_PROXIES: List[str] = []  # only these may set X-Forwarded-For
++    IP_ALLOW_LIST: List[str] = []
++    IP_DENY_LIST: List[str] = []
++    MAX_BODY_SIZE: int = 1_048_576  # 1 MiB for JSON endpoints
++
++    # ── Feature flags
+     ENABLE_MFA: bool = True
+     ENABLE_SSO: bool = True
+     ENABLE_AUDIT_LOGGING: bool = True
+-    
+-    # Paths
+-    BASE_DIR: Path = Path(__file__).parent.parent
+-    ROOT_PATH: str = ""  # For reverse proxy setups
+-    
+-    # Rate limiting
++    ALLOW_SELF_REGISTRATION: bool = False
++    DEVICE_BINDING_MODE: str = "observe"  # off | observe | enforce (ADR-08)
++
++    # ── Rate limiting (limits are "N/period", period: second|minute|hour)
+     RATE_LIMIT_DEFAULT: str = "100/minute"
+     RATE_LIMIT_AUTH: str = "10/minute"
+-    
+-    # File storage
+-    MAX_UPLOAD_SIZE: int = 52428800  # 50MB
++    RATE_LIMIT_ENABLED: bool = True
++
++    # ── Paths
++    BASE_DIR: Path = Path(__file__).parent.parent
++    ROOT_PATH: str = ""
++
++    # ── File storage
++    MAX_UPLOAD_SIZE: int = 52_428_800  # 50MB
+     ALLOWED_IMAGE_TYPES: List[str] = ["image/jpeg", "image/png", "image/gif"]
+     ALLOWED_DOCUMENT_TYPES: List[str] = [
+         "application/pdf", "application/msword",
+-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
++        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+     ]
+-    
+-    # Logging
++
++    # ── Logging
+     LOG_LEVEL: str = "INFO"
+-    LOG_FORMAT: str = "%(asctime)s - %(name)s - %(level)s - %(message)s [%(filename)s:%(lineno)d]"
++    LOG_FORMAT: str = (
++        "%(asctime)s - %(name)s - %(levelname)s - %(message)s "
++        "[%(filename)s:%(lineno)d]"
++    )
+ 
+-    # Migration: key_version fields should already exist in DB schema
+-    # Key rotation settings
++    # ── Key rotation (key_version is stored beside encrypted data, 4.9)
+     KEY_ROTATION_INTERVAL_DAYS: int = 365
+     KEY_VERSION: int = 1
+ 
++    # ------------------------------------------------------------------ #
++    @field_validator("SECRET_KEY")
++    @classmethod
++    def _secret_key_strength(cls, v: str) -> str:
++        if len(v) < 32:
++            raise ValueError("SECRET_KEY must be at least 32 characters")
++        return v
++
++    @field_validator("ALGORITHM")
++    @classmethod
++    def _algorithm_allowed(cls, v: str) -> str:
++        if v not in {"HS256", "RS256"}:
++            raise ValueError("ALGORITHM must be HS256 or RS256 ('none' is never allowed)")
++        return v
++
++    @field_validator("DEVICE_BINDING_MODE")
++    @classmethod
++    def _device_mode(cls, v: str) -> str:
++        if v not in {"off", "observe", "enforce"}:
++            raise ValueError("DEVICE_BINDING_MODE must be off | observe | enforce")
++        return v
++
++    @model_validator(mode="after")
++    def _cross_field_checks(self) -> "Settings":
++        if self.ALGORITHM == "RS256" and not (self.JWT_PRIVATE_KEY and self.JWT_PUBLIC_KEY):
++            raise ValueError("ALGORITHM=RS256 requires JWT_PRIVATE_KEY and JWT_PUBLIC_KEY")
++        if self.ENV == "production":
++            problems = []
++            if self.SECRET_KEY in _INSECURE_SECRETS:
++                problems.append("SECRET_KEY is a placeholder value")
++            if "*" in self.ALLOWED_HOSTS:
++                problems.append("ALLOWED_HOSTS must not contain '*'")
++            if self.DEBUG:
++                problems.append("DEBUG must be false")
++            if not self.DATA_ENCRYPTION_KEY:
++                problems.append("DATA_ENCRYPTION_KEY must be set (section 4.9)")
++            if not self.NATIONAL_ID_PEPPER:
++                problems.append("NATIONAL_ID_PEPPER must be set (ADR-06)")
++            if self.DEVICE_BINDING_MODE == "off":
++                problems.append("DEVICE_BINDING_MODE must not be 'off'")
++            if problems:
++                raise ValueError("Insecure production configuration: " + "; ".join(problems))
++        return self
++
++    # ------------------------------------------------------------------ #
++    @property
++    def is_production(self) -> bool:
++        return self.ENV == "production"
++
++    @property
++    def redis_url(self) -> str:
++        return self.REDIS_URL or f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
++
++    @property
++    def ws_allowed_origins(self) -> List[str]:
++        return self.ALLOWED_ORIGINS or self.CORS_ORIGINS
++
+ 
+-# Singleton instance
+ settings = Settings()
+ 
+ 
+-# Convenience accessors
+ def get_db_url() -> str:
+-    """Get the full database connection URL."""
+-    return f"postgresql+asyncpg://{settings.POSTGRES_USER}:{settings.POSTGRES_PASSWORD}@" \
+-           f"{settings.POSTGRES_SERVER}:{settings.POSTGRES_PORT}/{settings.POSTGRES_DB}"
+-
+-
+-# Validation helpers
+-@field_validator("POSTGRES_PASSWORD")
+-@classmethod
+-def password_not_empty(cls, v):
+-    if not v or v == "change_me":
+-        raise ValueError("POSTGRES_PASSWORD must be set in environment")
+-    return v
+-
+-
+-@field_validator("SECRET_KEY")
+-@classmethod
+-def secret_key_not_empty(cls, v):
+-    if not v or len(v) < 32:
+-        raise ValueError("SECRET_KEY must be at least 32 characters")
+-    return v
+\ No newline at end of file
++    """Async SQLAlchemy URL (single source of truth: SQLALCHEMY_DATABASE_URI)."""
++    return str(settings.SQLALCHEMY_DATABASE_URI)
+diff --git a/backend/app/core/context.py b/backend/app/core/context.py
+new file mode 100644
+index 0000000..2c39027
+--- /dev/null
++++ b/backend/app/core/context.py
+@@ -0,0 +1,56 @@
++"""Per-request context (architecture 3.1: ``core/context.py``).
++
++Uses :mod:`contextvars`, so concurrent requests/tasks never see each other's
++values. (The old implementation stored a single module-level global, which
++leaks user/IP/MAC between simultaneous requests - and audit rows are built
++from this data.)
++"""
++from __future__ import annotations
++
++from contextvars import ContextVar, Token
++from dataclasses import asdict, dataclass, field
++from typing import Any, Optional
++from uuid import uuid4
++
++
++@dataclass
++class RequestContext:
++    request_id: str = field(default_factory=lambda: str(uuid4()))
++    correlation_id: Optional[str] = None
++    user_id: Optional[str] = None
++    session_id: Optional[str] = None
++    ip: Optional[str] = None
++    user_agent: Optional[str] = None
++    mac_address: Optional[str] = None
++    mac_verified: bool = False
++    device_fingerprint: Optional[str] = None
++    path: Optional[str] = None
++    method: Optional[str] = None
++
++    def to_dict(self) -> dict[str, Any]:
++        return asdict(self)
++
++
++_ctx: ContextVar[Optional[RequestContext]] = ContextVar("request_ctx", default=None)
++
++
++def set_context(ctx: RequestContext) -> Token:
++    return _ctx.set(ctx)
++
++
++def reset_context(token: Token) -> None:
++    _ctx.reset(token)
++
++
++def get_context() -> RequestContext:
++    """Current context, or an empty one outside a request (workers, tests)."""
++    return _ctx.get() or RequestContext()
++
++
++def bind_user(user_id: Any, session_id: Any = None) -> None:
++    """Called after authentication so later audit rows carry the actor."""
++    ctx = _ctx.get()
++    if ctx is not None:
++        ctx.user_id = str(user_id) if user_id is not None else None
++        if session_id is not None:
++            ctx.session_id = str(session_id)
+diff --git a/backend/app/core/database.py b/backend/app/core/database.py
+index e81b2a0..a8e65e1 100644
+--- a/backend/app/core/database.py
++++ b/backend/app/core/database.py
+@@ -6,7 +6,9 @@ names the rest of the codebase imports (``get_session``, ``engine``,
+ """
+ from app.core.db.session import (
+     async_session_factory,
++    dispose_engine,
+     engine,
++    get_db,
+     get_session,
+ )
+ 
+@@ -22,4 +24,6 @@ __all__ = [
+     "async_session_factory",
+     "async_session_context",
+     "get_async_session",
++    "get_db",
++    "dispose_engine",
+ ]
+diff --git a/backend/app/core/db/base.py b/backend/app/core/db/base.py
+index 59f3b44..4b12e1e 100644
+--- a/backend/app/core/db/base.py
++++ b/backend/app/core/db/base.py
+@@ -1,12 +1,11 @@
+ import uuid
+-from datetime import datetime
++from datetime import datetime, timezone
+ from typing import TypeVar, Generic, Optional, List
+ from sqlalchemy import (
+     Column, Integer, String, DateTime, Boolean, Text, 
+     JSON, func, Index, CheckConstraint
+ )
+-from sqlalchemy.ext.declarative import declarative_base
+-from sqlalchemy.orm import declared_attr
++from sqlalchemy.orm import declarative_base, declared_attr
+ from sqlalchemy.sql import expression
+ 
+ Base = declarative_base()
+@@ -55,7 +54,7 @@ class BaseModel(Base):
+     
+     def soft_delete(self):
+         """Mark record as deleted instead of hard delete."""
+-        self.deleted_at = datetime.utcnow()
++        self.deleted_at = datetime.now(timezone.utc)
+     
+     def is_deleted(self) -> bool:
+         """Check if record is soft-deleted."""
+@@ -78,7 +77,7 @@ class BaseModel(Base):
+     
+     def update_timestamp(self):
+         """Update the updated_at timestamp."""
+-        self.updated_at = datetime.utcnow()
++        self.updated_at = datetime.now(timezone.utc)
+ 
+ 
+ # Mixin for audit tracking
+@@ -108,7 +107,7 @@ class DatabaseUtils:
+     @staticmethod
+     def current_timestamp() -> datetime:
+         """Get current UTC timestamp."""
+-        return datetime.utcnow()
++        return datetime.now(timezone.utc)
+     
+     @staticmethod
+     def paginate_query(query, page: int = 1, size: int = 20):
+diff --git a/backend/app/core/db/session.py b/backend/app/core/db/session.py
+index 66ce06d..1ac597d 100644
+--- a/backend/app/core/db/session.py
++++ b/backend/app/core/db/session.py
+@@ -25,10 +25,9 @@ from app.core.config import settings
+ engine: AsyncEngine = create_async_engine(
+     # PostgresDsn validates to a URL object; the engine needs a plain string.
+     str(settings.SQLALCHEMY_DATABASE_URI),
+-    echo=settings.ENV == "development",
+-    future=True,
+-    pool_size=20,
+-    max_overflow=30,
++    echo=settings.SQL_ECHO,
++    pool_size=settings.DB_POOL_SIZE,
++    max_overflow=settings.DB_MAX_OVERFLOW,
+     pool_pre_ping=True,
+     pool_recycle=3600,
+     connect_args={
+@@ -59,6 +58,27 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
+         yield session
+ 
+ 
++async def get_db() -> AsyncGenerator[AsyncSession, None]:
++    """FastAPI dependency: one session per request, one transaction.
++
++    Commits when the handler returns, rolls back on any exception. Business
++    data and the outbox/audit rows written through the same session are
++    therefore atomic (architecture 2.3 / 12.3).
++    """
++    async with async_session_factory() as session:
++        try:
++            yield session
++            await session.commit()
++        except BaseException:
++            await session.rollback()
++            raise
++
++
++async def dispose_engine() -> None:
++    """Close pooled connections (called from the app lifespan on shutdown)."""
++    await engine.dispose()
++
++
+ # Unit of Work pattern
+ class UnitOfWork:
+     """Unit of Work pattern for managing database transactions."""
+@@ -117,6 +137,6 @@ class Transaction:
+ 
+ # Export
+ __all__ = [
+-    "engine", "async_session_factory", "get_session", 
+-    "UnitOfWork", "Transaction"
++    "engine", "async_session_factory", "get_session", "get_db",
++    "dispose_engine", "UnitOfWork", "Transaction",
+ ]
+\ No newline at end of file
+diff --git a/backend/app/core/dependencies.py b/backend/app/core/dependencies.py
+index d6731e6..973f25b 100644
+--- a/backend/app/core/dependencies.py
++++ b/backend/app/core/dependencies.py
+@@ -120,6 +120,9 @@ async def get_current_user(
+                 detail="Token revoked",
+                 headers={"WWW-Authenticate": "Bearer"},
+             )
++        # Later audit rows / events of this request carry the actor
++        from app.core.context import bind_user
++        bind_user(user.id)
+         return str(user.id)
+ 
+ 
+@@ -130,10 +133,12 @@ def check_rate_limit(
+     limit: int = 100,
+     window_seconds: int = 60
+ ) -> bool:
+-    """Check if request is within rate limits.
+-    Simplified implementation - real one uses Redis.
++    """Deprecated no-op kept for import compatibility.
++
++    Rate limiting is enforced globally by ``RateLimitMiddleware``
++    (settings ``RATE_LIMIT_DEFAULT`` / ``RATE_LIMIT_AUTH``); do not rely on
++    this dependency for protection.
+     """
+-    # Placeholder - always returns True
+     return True
+ 
+ 
+diff --git a/backend/app/core/errors.py b/backend/app/core/errors.py
+index 271ca23..92f4fa2 100644
+--- a/backend/app/core/errors.py
++++ b/backend/app/core/errors.py
+@@ -1,221 +1,178 @@
+-import traceback
++"""Error types and exception handlers (architecture 5.1: uniform error format).
++
++Body shape (unchanged, so existing clients keep working)::
++
++    {"error": "<CODE>", "message": "<fa text>", "success": false, "request_id": "..."}
++"""
++from __future__ import annotations
++
+ import logging
+ from typing import Any, Dict, Optional
+-from fastapi import FastAPI, Request, HTTPException
++
++from fastapi import FastAPI, Request
++from fastapi.exceptions import RequestValidationError
+ from fastapi.responses import JSONResponse
+-from starlette import status
+ from pydantic import ValidationError
++from starlette import status
++from starlette.exceptions import HTTPException as StarletteHTTPException
+ 
+ from app.core.config import settings
++from app.core.context import get_context
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ class APIError(Exception):
+     """Base class for API errors."""
+-    
++
+     def __init__(
+-        self, 
+-        error_code: str, 
+-        message: str, 
++        self,
++        error_code: str,
++        message: str,
+         status_code: int = status.HTTP_400_BAD_REQUEST,
+-        details: Optional[Dict] = None
++        details: Optional[Dict] = None,
++        headers: Optional[Dict[str, str]] = None,
+     ):
++        super().__init__(message)
+         self.error_code = error_code
+         self.message = message
+         self.status_code = status_code
+         self.details = details or {}
+-    
++        self.headers = headers
++
+     def to_dict(self) -> Dict[str, Any]:
+         return {
+             "error": self.error_code,
+             "message": self.message,
+             "success": False,
+-            **self.details
++            "request_id": get_context().request_id,
++            **self.details,
+         }
+ 
+ 
+-# Specific error classes
+ class ValidationErrorAPI(APIError):
+-    """Pydantic validation error."""
+-    def __init__(self, details: dict):
+-        super().__init__(
+-            error_code="VALIDATION_ERROR",
+-            message="داده‌های ورودی نامعتبر هستند.",
+-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+-            details=details
+-        )
++    def __init__(self, details: dict | None = None, message: str = "داده‌های ورودی نامعتبر هستند."):
++        super().__init__("VALIDATION_ERROR", message,
++                         status.HTTP_422_UNPROCESSABLE_ENTITY, details)
+ 
+ 
+ class AuthenticationError(APIError):
+-    """Authentication failed."""
+-    def __init__(self, message: str = "احراز هویت_FAILED."):
+-        super().__init__(
+-            error_code="AUTHENTICATION_ERROR",
+-            message=message,
+-            status_code=status.HTTP_401_UNAUTHORIZED
+-        )
++    def __init__(self, message: str = "احراز هویت ناموفق بود.", error_code: str = "AUTHENTICATION_ERROR"):
++        super().__init__(error_code, message, status.HTTP_401_UNAUTHORIZED,
++                         headers={"WWW-Authenticate": "Bearer"})
+ 
+ 
+ class AuthorizationError(APIError):
+-    """Authorization denied."""
+-    def __init__(self, message: str = "شما دسترسی لازم را ندارید."):
+-        super().__init__(
+-            error_code="AUTHORIZATION_ERROR",
+-            message=message,
+-            status_code=status.HTTP_403_FORBIDDEN
+-        )
++    def __init__(self, message: str = "شما دسترسی لازم را ندارید.", details: dict | None = None):
++        super().__init__("AUTHORIZATION_ERROR", message, status.HTTP_403_FORBIDDEN, details)
++
++
++class PermissionDeniedError(APIError):
++    """RBAC denial (architecture 7.4 / 12.4). ``code`` is the machine reason,
++    e.g. ``CANNOT_GRANT_EQUAL_OR_HIGHER_ROLE`` or ``CANNOT_SELF_ASSIGN``."""
++
++    def __init__(self, code: str = "PERMISSION_DENIED", message: str | None = None, **details: Any):
++        self.code = code
++        super().__init__(code, message or "شما دسترسی لازم را ندارید.",
++                         status.HTTP_403_FORBIDDEN, details or None)
+ 
+ 
+ class NotFoundError(APIError):
+-    """Resource not found (404 vs 403 distinction)."""
++    """404 - also used instead of 403 when existence must not leak (5.1)."""
++
+     def __init__(self, resource: str = "منبع"):
+-        super().__init__(
+-            error_code="NOT_FOUND",
+-            message=f"{resource} یافت نشد.",
+-            status_code=status.HTTP_404_NOT_FOUND
+-        )
++        super().__init__("NOT_FOUND", f"{resource} یافت نشد.", status.HTTP_404_NOT_FOUND)
+ 
+ 
+ class ConflictError(APIError):
+-    """Resource conflict."""
+-    def __init__(self, message: str = "Resource conflict."):
+-        super().__init__(
+-            error_code="CONFLICT_ERROR",
+-            message=message,
+-            status_code=status.HTTP_409_CONFLICT
+-        )
++    def __init__(self, message: str = "تعارض در منبع."):
++        super().__init__("CONFLICT_ERROR", message, status.HTTP_409_CONFLICT)
+ 
+ 
+ class RateLimitError(APIError):
+-    """Rate limit exceeded."""
+     def __init__(self, retry_after: int = 60):
+         super().__init__(
+-            error_code="RATE_LIMIT_EXCEEDED",
+-            message="چندین درخواست بیش از حد ارسال کردید. لطفاً منتظر بمانید.",
+-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+-            details={"retry_after": retry_after}
++            "RATE_LIMIT_EXCEEDED",
++            "درخواست‌های بیش از حد ارسال شده است. لطفاً کمی بعد تلاش کنید.",
++            status.HTTP_429_TOO_MANY_REQUESTS,
++            {"retry_after": retry_after},
++            headers={"Retry-After": str(retry_after)},
+         )
+ 
+ 
+ class MFARequiredError(APIError):
+-    """MFA verification required."""
+     def __init__(self, method: str = "totp"):
+-        super().__init__(
+-            error_code="MFA_REQUIRED",
+-            message=f"احراز هویت دو عاملی لازم است ({method}).",
+-            status_code=status.HTTP_401_UNAUTHORIZED
+-        )
++        super().__init__("MFA_REQUIRED", f"احراز هویت دو مرحله‌ای لازم است ({method}).",
++                         status.HTTP_401_UNAUTHORIZED)
+ 
+ 
+ class DeviceNotTrustedError(APIError):
+-    """Device not trusted."""
+     def __init__(self):
+-        super().__init__(
+-            error_code="DEVICE_NOT_TRUSTED",
+-            message="این دستگاه confiance نیست. با مدیر سیستم تماس بگیرید.",
+-            status_code=status.HTTP_403_FORBIDDEN
+-        )
++        super().__init__("DEVICE_NOT_TRUSTED",
++                         "ورود از این دستگاه مجاز نیست. با مدیر سیستم تماس بگیرید.",
++                         status.HTTP_403_FORBIDDEN)
+ 
+ 
+ class PrivacyHiddenError(APIError):
+-    """Data hidden due to privacy settings."""
++    """Hidden by privacy settings; 404 so existence does not leak."""
++
+     def __init__(self):
+-        super().__init__(
+-            error_code="PRIVACY_HIDDEN",
+-            message="این داده به دلیل تنظیمات حریم خصوصیvisibility پنهان است.",
+-            status_code=status.HTTP_404_NOT_FOUND  # 404 to avoid leaking existence
+-        )
++        super().__init__("PRIVACY_HIDDEN", "این داده به دلیل تنظیمات حریم خصوصی قابل نمایش نیست.",
++                         status.HTTP_404_NOT_FOUND)
+ 
+ 
+-# Exception handlers
++# ── Handlers ────────────────────────────────────────────────────────────
+ 
++def _body(code: str, message: Any, **extra: Any) -> dict:
++    return {"error": code, "message": message, "success": False,
++            "request_id": get_context().request_id, **extra}
+ 
+-async def validation_exception_handler(request: Request, exc: ValidationError):
+-    """Handle Pydantic validation errors."""
+-    errors = exc.errors()
+-    # Simplify error messages for Persian users
+-    simplified = []
+-    for error in errors:
+-        loc = " -> ".join(str(x) for x in error.get("loc", []))
+-        msg = error.get("msg", "خطا")
+-        simplified.append(f"{loc}: {msg}")
+-    
+-    logger.warning(
+-        f"Validation error on {request.method} {request.url}: {simplified}"
+-    )
+-    
++
++def _simplify_errors(exc: RequestValidationError | ValidationError) -> list[str]:
++    out = []
++    for err in exc.errors():
++        loc = " -> ".join(str(x) for x in err.get("loc", []) if x != "body")
++        out.append(f"{loc}: {err.get('msg', 'خطا')}" if loc else str(err.get("msg", "خطا")))
++    return out
++
++
++async def validation_exception_handler(request: Request, exc: RequestValidationError | ValidationError):
++    details = _simplify_errors(exc)
++    logger.warning("Validation error on %s %s: %s", request.method, request.url.path, details)
+     return JSONResponse(
+         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+-        content={
+-            "error": "VALIDATION_ERROR",
+-            "message": "داده‌های ورودی نامعتبر هستند.",
+-            "details": simplified,
+-            "success": False
+-        }
++        content=_body("VALIDATION_ERROR", "داده‌های ورودی نامعتبر هستند.", details=details),
+     )
+ 
+ 
+ async def api_error_handler(request: Request, exc: APIError):
+-    """Handle custom API errors."""
+-    logger.warning(
+-        f"API error on {request.method} {request.url}: "
+-        f"{exc.error_code} - {exc.message}"
+-    )
+-    
+-    return JSONResponse(
+-        status_code=exc.status_code,
+-        content={
+-            "error": exc.error_code,
+-            "message": exc.message,
+-            "success": False,
+-            **exc.details
+-        }
+-    )
++    logger.warning("API error on %s %s: %s - %s", request.method, request.url.path,
++                   exc.error_code, exc.message)
++    return JSONResponse(status_code=exc.status_code, content=exc.to_dict(), headers=exc.headers)
+ 
+ 
+-async def http_exception_handler(request: Request, exc: HTTPException):
+-    """Handle FastAPI HTTP exceptions."""
+-    logger.error(
+-        f"HTTP error on {request.method} {request.url}: "
+-        f"{exc.status_code} - {exc.detail}"
+-    )
+-    
+-    return JSONResponse(
+-        status_code=exc.status_code,
+-        content={
+-            "error": "HTTP_ERROR",
+-            "message": exc.detail,
+-            "success": False
+-        }
+-    )
++async def http_exception_handler(request: Request, exc: StarletteHTTPException):
++    """Also catches Starlette's own 404/405 (FastAPI's HTTPException subclasses it)."""
++    detail = exc.detail if isinstance(exc.detail, str) else "خطا"
++    code = {401: "AUTHENTICATION_ERROR", 403: "AUTHORIZATION_ERROR", 404: "NOT_FOUND",
++            405: "METHOD_NOT_ALLOWED"}.get(exc.status_code, "HTTP_ERROR")
++    if exc.status_code >= 500:
++        logger.error("HTTP %s on %s %s: %s", exc.status_code, request.method, request.url.path, detail)
++    return JSONResponse(status_code=exc.status_code, content=_body(code, detail),
++                        headers=getattr(exc, "headers", None))
+ 
+ 
+ async def general_exception_handler(request: Request, exc: Exception):
+-    """Handle unexpected errors - log and return generic error."""
+-    # In production, mask the details
+-    error_detail = str(exc) if settings.DEBUG else "خطای داخلی سرور"
+-    
+-    logger.exception(
+-        f"Unexpected error on {request.method} {request.url}: {exc}"
+-    )
+-    
+-    return JSONResponse(
+-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+-        content={
+-            "error": "INTERNAL_SERVER_ERROR",
+-            "message": error_detail,
+-            "success": False,
+-            "request_id": getattr(getattr(request, "state", None),
+-                                "request_id", "unknown")
+-        }
+-    )
++    """Unexpected error: log with stack trace, never leak internals in production."""
++    logger.exception("Unexpected error on %s %s", request.method, request.url.path)
++    message = str(exc) if (settings.DEBUG and not settings.is_production) else "خطای داخلی سرور"
++    return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
++                        content=_body("INTERNAL_SERVER_ERROR", message))
+ 
+ 
+-# Register all handlers
+-def register_exception_handlers(app: FastAPI):
+-    """Register all exception handlers with the FastAPI app."""
++def register_exception_handlers(app: FastAPI) -> None:
++    app.add_exception_handler(RequestValidationError, validation_exception_handler)
+     app.add_exception_handler(ValidationError, validation_exception_handler)
+     app.add_exception_handler(APIError, api_error_handler)
+-    app.add_exception_handler(HTTPException, http_exception_handler)
+-    app.add_exception_handler(Exception, general_exception_handler)
+\ No newline at end of file
++    app.add_exception_handler(StarletteHTTPException, http_exception_handler)
++    app.add_exception_handler(Exception, general_exception_handler)
+diff --git a/backend/app/core/events.py b/backend/app/core/events.py
+deleted file mode 100644
+index f1b1136..0000000
+--- a/backend/app/core/events.py
++++ /dev/null
+@@ -1,31 +0,0 @@
+-"""Event bus for cross-module communication."""
+-from typing import Dict, List, Callable, Any
+-from concurrent.futures import ThreadPoolExecutor
+-
+-
+-class EventBus:
+-    """Simple event bus for inter-module communication."""
+-    
+-    def __init__(self):
+-        self._subscribers: Dict[str, List[Callable]] = {}
+-        self._executor = ThreadPoolExecutor(max_workers=4)
+-    
+-    def subscribe(self, event_type: str, handler: Callable) -> None:
+-        """Subscribe to an event type."""
+-        if event_type not in self._subscribers:
+-            self._subscribers[event_type] = []
+-        self._subscribers[event_type].append(handler)
+-    
+-    def publish(self, event_type: str, data: Any = None) -> None:
+-        """Publish an event to all subscribers."""
+-        handlers = self._subscribers.get(event_type, [])
+-        # Run handlers in thread pool to avoid blocking
+-        for handler in handlers:
+-            try:
+-                self._executor.submit(handler, data)
+-            except Exception:
+-                pass
+-
+-
+-# Global event bus instance
+-event_bus = EventBus()
+\ No newline at end of file
+diff --git a/backend/app/core/events/bus.py b/backend/app/core/events/bus.py
+index 495572b..d604df7 100644
+--- a/backend/app/core/events/bus.py
++++ b/backend/app/core/events/bus.py
+@@ -49,10 +49,10 @@ app/core/events/bus.py
+ from __future__ import annotations
+ 
+ import logging
+-from dataclasses import dataclass, field
++from collections import defaultdict
++from dataclasses import dataclass, field, replace
+ from datetime import datetime, timezone
+ from typing import Any, Awaitable, Callable, DefaultDict
+-from collections import defaultdict
+ from uuid import UUID, uuid4
+ 
+ logger = logging.getLogger("core.events")
+@@ -63,11 +63,7 @@ EventHandler = Callable[["DomainEvent", Any], Awaitable[None]]
+ 
+ @dataclass(frozen=True)
+ class DomainEvent:
+-    """رویداد دامنه — دقیقاً مطابق سند معماری v2.0، بخش ۲.۳.
+-
+-    ``event_type`` باید با کاتالوگ رویدادهای سند (بخش ۲.۴) هماهنگ باشد،
+-    مثل ``"auth.login.succeeded"``.
+-    """
++    """رویداد دامنه — مطابق سند معماری v2.0، بخش ۲.۳."""
+ 
+     event_type: str
+     payload: dict[str, Any]
+@@ -77,52 +73,74 @@ class DomainEvent:
+     correlation_id: UUID | None = None
+ 
+ 
++def _as_uuid(value: Any) -> UUID | None:
++    try:
++        return UUID(str(value)) if value else None
++    except (ValueError, AttributeError):
++        return None
++
++
+ class EventBus:
+-    """Event Bus درون‌پروسه‌ای؛ یک نمونه‌ی Singleton (``event_bus``) در کل اپ استفاده می‌شود."""
++    """Event Bus درون‌پروسه‌ای؛ یک نمونه‌ی Singleton (``event_bus``) در کل اپ.
++
++    دو نوع مشترک:
++
++    * ``transactional=True`` (پیش‌فرض) — داخل ``publish`` و در همان تراکنش اجرا
++      می‌شود (مثل Audit). اگر تراکنش Rollback شود، اثر handler هم برمی‌گردد.
++    * ``transactional=False`` — مصرف‌کننده‌ی «بعد از commit» (مثل Notification):
++      فقط توسط Dispatcher از روی جدول Outbox با تضمین At-Least-Once فراخوانی
++      می‌شود و باید با ``event_id`` Idempotent باشد.
++
++    قبلاً Dispatcher همان handlerهای هم‌تراکنش را دوباره صدا می‌زد و ردیف‌های
++    Audit تکراری ساخته می‌شد؛ حالا این دو دسته کاملاً جدا هستند.
++    """
+ 
+     def __init__(self) -> None:
+-        self._handlers: DefaultDict[str, list[EventHandler]] = defaultdict(list)
++        self._sync: DefaultDict[str, list[EventHandler]] = defaultdict(list)
++        self._async: DefaultDict[str, list[EventHandler]] = defaultdict(list)
+ 
+-    def subscribe(self, event_type: str, handler: EventHandler) -> None:
+-        """یک ماژول مصرف‌کننده، خودش را برای یک نوع رویداد ثبت می‌کند.
++    def subscribe(self, event_type: str, handler: EventHandler, *,
++                  transactional: bool = True) -> None:
++        target = self._sync if transactional else self._async
++        if handler in target[event_type]:  # idempotent registration (reload / tests)
++            return
++        target[event_type].append(handler)
++        logger.debug("subscribed %s handler for %s", "txn" if transactional else "async", event_type)
+ 
+-        هیچ‌جا از ماژول ناشر import نمی‌شود؛ فقط رشته‌ی ``event_type``
+-        (که در کاتالوگ رویدادهای سند مستند شده) لازم است.
+-        """
+-        self._handlers[event_type].append(handler)
+-        logger.debug("subscribed handler for event_type=%s", event_type)
++    def handlers_for(self, event_type: str, *, transactional: bool) -> list[EventHandler]:
++        return list((self._sync if transactional else self._async).get(event_type, ()))
++
++    def clear(self) -> None:
++        """Remove every subscription (test helper)."""
++        self._sync.clear()
++        self._async.clear()
+ 
+     async def publish(self, event: DomainEvent, session: Any) -> None:
+-        """رویداد را هم به Outbox درج می‌کند و هم بلافاصله به مشترکین درون‌پروسه تحویل می‌دهد.
++        """Outbox را در همان تراکنش می‌نویسد و handlerهای هم‌تراکنش را اجرا می‌کند.
+ 
+-        ``session`` باید همان AsyncSession تراکنش جاری باشد تا اگر
+-        تراکنش اصلی Rollback شود، هیچ اثری (نه ردیف Outbox و نه نوشته‌ی
+-        هیچ handler‌ی که در همین session کار کرده) باقی نماند.
++        ``actor_id`` / ``correlation_id`` در صورت خالی بودن از Request Context
++        پر می‌شوند تا کل زنجیره‌ی یک درخواست قابل ردیابی باشد.
+         """
+-        # وارد کردن دیرهنگام (lazy import) برای پرهیز از وابستگی حلقه‌ای
+-        # بین bus.py و outbox.py در زمان import ماژول.
++        from app.core.context import get_context
+         from app.core.events.outbox import OutboxMessage
+ 
+-        session.add(OutboxMessage.from_event(event))
+-
+-        handlers = self._handlers.get(event.event_type, [])
+-        if not handlers:
+-            logger.debug(
+-                "no in-process subscriber for event_type=%s (outbox row still written)",
+-                event.event_type,
++        ctx = get_context()
++        if event.correlation_id is None or event.actor_id is None:
++            event = replace(
++                event,
++                correlation_id=event.correlation_id or _as_uuid(ctx.correlation_id),
++                actor_id=event.actor_id or _as_uuid(ctx.user_id),
+             )
+-            return
+ 
+-        for handler in handlers:
++        session.add(OutboxMessage.from_event(event))
++
++        for handler in self.handlers_for(event.event_type, transactional=True):
+             try:
+                 await handler(event, session)
+-            except Exception:  # noqa: BLE001 — یک handler خراب نباید انتشار رویداد را متوقف کند
+-                logger.exception(
+-                    "event handler failed for event_type=%s (event_id=%s)",
+-                    event.event_type, event.event_id,
+-                )
+-                raise  # همان تراکنش است؛ اجازه بده خطا بالا برود و کل تراکنش Rollback شود
++            except Exception:  # noqa: BLE001
++                logger.exception("event handler failed for event_type=%s (event_id=%s)",
++                                 event.event_type, event.event_id)
++                raise  # همان تراکنش است؛ کل تراکنش Rollback شود
+ 
+ 
+-# نمونه‌ی Singleton — طبق الگوی import سند: `from app.core.events.bus import event_bus`
+ event_bus = EventBus()
+diff --git a/backend/app/core/events/dispatcher.py b/backend/app/core/events/dispatcher.py
+index ca3e062..525887b 100644
+--- a/backend/app/core/events/dispatcher.py
++++ b/backend/app/core/events/dispatcher.py
+@@ -1,34 +1,21 @@
+ """
+ app/core/events/dispatcher.py
+ 
+-Dispatcher برای ردیف‌های Outbox که باید به مصرف‌کننده‌های **خارج از
+-فرآیند** تحویل داده شوند (مثل Celery workers برای Email/Push/Export —
+-نه Audit، که همان‌طور که در bus.py توضیح داده شد، درون‌پروسه و هم‌تراکنش
+-مصرف می‌شود).
+-
+-طبق ساختار پوشه‌ی سند (بخش ۳.۱)، این تابع باید توسط یک تسک دوره‌ای
+-Celery در ``workers/tasks/outbox_dispatcher.py`` فراخوانی شود، مثلاً
+-هر چند ثانیه یک‌بار:
+-
+-    # app/workers/tasks/outbox_dispatcher.py
+-    from app.workers.celery_app import celery_app
+-    from app.core.events.dispatcher import dispatch_pending_outbox_messages
+-
+-    @celery_app.task
+-    def dispatch_outbox():
+-        import asyncio
+-        asyncio.run(dispatch_pending_outbox_messages())
+-
+-⚠️ این پیاده‌سازی یک **نقطه‌ی شروع حداقلی** است، نه نسخه‌ی نهایی تولید:
+-- تحویل واقعی به مصرف‌کننده‌های خارج از فرآیند (مثلاً صف Celery جداگانه
+-  به‌ازای هر نوع رویداد) هنوز باید اضافه شود؛ فعلاً فقط handlerهای
+-  درون‌پروسه‌ی ثبت‌شده روی همان ``event_bus`` را دوباره صدا می‌زند (برای
+-  مواردی که هنگام publish اصلی، به هر دلیل consumer در آن لحظه در
+-  حافظه نبوده — سناریوی راه‌اندازی مجدد سرویس).
+-- قفل توزیع‌شده (مثلاً Redis lock) برای جلوگیری از پردازش هم‌زمان یک
+-  ردیف توسط چند Worker اضافه نشده — برای تک-Worker فعلاً کافی است.
++Dispatcher ردیف‌های Outbox برای مصرف‌کننده‌های «بعد از commit»
++(``subscribe(..., transactional=False)``) — مثل Notification/Push/Email.
++handlerهای هم‌تراکنش (Audit) اینجا **اجرا نمی‌شوند** (قبلاً دوباره اجرا
++می‌شدند و ردیف تکراری می‌ساختند).
++
++طبق سند (بخش ۳.۱) باید توسط تسک دوره‌ای Celery
++(``workers/tasks/outbox_dispatcher.py``) فراخوانی شود.
++
++* ``FOR UPDATE SKIP LOCKED`` — چند Worker همزمان روی یک ردیف کار نمی‌کنند.
++* هر ردیف در یک SAVEPOINT پردازش می‌شود؛ خطای یک ردیف تراکنش ردیف‌های
++  دیگر را خراب نمی‌کند.
++* ردیفی که مصرف‌کننده‌ی async ندارد، بلافاصله dispatched علامت می‌خورد.
++* بعد از ``MAX_ATTEMPTS`` شکست، ردیف رها می‌شود (با ``last_error``) تا
++  دستی بررسی شود (dead-letter).
+ """
+-
+ from __future__ import annotations
+ 
+ import logging
+@@ -45,42 +32,36 @@ MAX_ATTEMPTS = 5
+ 
+ 
+ async def dispatch_pending_outbox_messages(session, batch_size: int = 100) -> int:
+-    """ردیف‌های dispatched_at IS NULL را پردازش و علامت‌گذاری می‌کند.
+-
+-    ``session`` یک AsyncSession جدا از تراکنش publish اصلی است (این
+-    تابع در Worker جدا اجرا می‌شود). عدد ردیف‌های پردازش‌شده را برمی‌گرداند.
+-    """
+-    result = await session.execute(
++    """Process pending rows; returns the number successfully dispatched."""
++    rows = (await session.execute(
+         select(OutboxMessage)
+         .where(OutboxMessage.dispatched_at.is_(None))
+         .where(OutboxMessage.attempts < MAX_ATTEMPTS)
+-        .order_by(OutboxMessage.created_at)
++        .order_by(OutboxMessage.id)
+         .limit(batch_size)
+-        .with_for_update(skip_locked=True)  # چند Worker هم‌زمان ایمن باشند
+-    )
+-    rows = result.scalars().all()
++        .with_for_update(skip_locked=True)
++    )).scalars().all()
+ 
+     processed = 0
+     for row in rows:
+         event = DomainEvent(
+-            event_type=row.event_type,
+-            payload=row.payload,
+-            event_id=row.event_id,
+-            correlation_id=row.correlation_id,
++            event_type=row.event_type, payload=row.payload,
++            event_id=row.event_id, correlation_id=row.correlation_id,
++            occurred_at=row.created_at,
+         )
++        handlers = event_bus.handlers_for(event.event_type, transactional=False)
+         try:
+-            handlers = event_bus._handlers.get(event.event_type, [])  # noqa: SLF001
+-            for handler in handlers:
+-                await handler(event, session)
++            async with session.begin_nested():  # SAVEPOINT
++                for handler in handlers:
++                    await handler(event, session)
+             row.dispatched_at = datetime.now(timezone.utc)
++            row.last_error = None
+             processed += 1
+         except Exception as exc:  # noqa: BLE001
+-            row.attempts += 1
++            row.attempts = (row.attempts or 0) + 1
+             row.last_error = str(exc)[:2000]
+-            logger.exception(
+-                "outbox dispatch failed for event_id=%s (attempt %s/%s)",
+-                row.event_id, row.attempts, MAX_ATTEMPTS,
+-            )
++            logger.exception("outbox dispatch failed for event_id=%s (attempt %s/%s)",
++                             row.event_id, row.attempts, MAX_ATTEMPTS)
+ 
+     await session.commit()
+     return processed
+diff --git a/backend/app/core/events/outbox.py b/backend/app/core/events/outbox.py
+index 828469e..bd53876 100644
+--- a/backend/app/core/events/outbox.py
++++ b/backend/app/core/events/outbox.py
+@@ -26,6 +26,7 @@ app/core/events/outbox.py
+ 
+ from __future__ import annotations
+ 
++import json
+ from datetime import datetime
+ from typing import Any
+ from uuid import UUID
+@@ -69,6 +70,7 @@ class OutboxMessage(Base):
+         return cls(
+             event_id=event.event_id,
+             event_type=event.event_type,
+-            payload=dict(event.payload),
++            # JSONB needs JSON-safe values (UUID/datetime/Decimal -> str)
++            payload=json.loads(json.dumps(event.payload, default=str)),
+             correlation_id=event.correlation_id,
+         )
+diff --git a/backend/app/core/middleware.py b/backend/app/core/middleware.py
+deleted file mode 100644
+index bbe8d81..0000000
+--- a/backend/app/core/middleware.py
++++ /dev/null
+@@ -1,226 +0,0 @@
+-import time
+-import uuid
+-from typing import Optional, Dict, Any, Callable
+-from fastapi import Request, Response
+-from fastapi.responses import JSONResponse
+-from starlette.middleware.base import BaseHTTPMiddleware
+-from starlette.middleware.cors import CORSMiddleware
+-from starlette.middleware.trustedhost import TrustedHostMiddleware
+-import structlog
+-
+-from app.core.config import settings
+-from app.core.errors import APIError
+-
+-
+-# Context variable for request context
+-# In a real implementation, this would use contextvars
+-_request_context: Optional[Dict[str, Any]] = None
+-
+-
+-class RequestContext:
+-    """Holds request-level context data."""
+-    
+-    def __init__(self):
+-        self.request_id: str = str(uuid.uuid4())
+-        self.user_id: Optional[str] = None
+-        self.user_ip: Optional[str] = None
+-        self.mac_address: Optional[str] = None
+-        self.device_fingerprint: Optional[str] = None
+-        self.session_id: Optional[str] = None
+-        self.correlation_id: Optional[str] = None
+-        self.geo_location: Optional[Dict] = None
+-        self.start_time: Optional[float] = None
+-    
+-    def to_dict(self) -> Dict[str, Any]:
+-        return {
+-            "request_id": self.request_id,
+-            "user_id": self.user_id,
+-            "user_ip": self.user_ip,
+-            "mac_address": self.mac_address,
+-            "device_fingerprint": self.device_fingerprint,
+-            "session_id": self.session_id,
+-            "correlation_id": self.correlation_id,
+-        }
+-
+-
+-def set_request_context(ctx: RequestContext):
+-    """Set the current request context (for within-request use)."""
+-    global _request_context
+-    _request_context = ctx.to_dict()
+-
+-
+-def get_request_context() -> Optional[Dict[str, Any]]:
+-    """Get the current request context."""
+-    return _request_context
+-
+-
+-# --- Middleware Chain ---
+-
+-class RequestIDMiddleware(BaseHTTPMiddleware):
+-    """Add unique Request-ID to every request."""
+-    
+-    async def dispatch(self, request: Request, call_next):
+-        request_id = str(uuid.uuid4())
+-        response = await call_next(request)
+-        response.headers["X-Request-ID"] = request_id
+-        return response
+-
+-
+-class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+-    """Add security headers to every response."""
+-    
+-    async def dispatch(self, request: Request, call_next):
+-        response = await call_next(request)
+-        
+-        # Content Security Policy
+-        response.headers["X-Content-Type-Options"] = "nosniff"
+-        response.headers["X-Frame-Options"] = "DENY"
+-        response.headers["X-XSS-Protection"] = "1; mode=block"
+-        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+-        
+-        # CSP - lock down
+-        csp = (
+-            "default-src 'self'; "
+-            "script-src 'self' 'unsafe-inline' https://apis.google.com; "
+-            "style-src 'self' 'unsafe-inline'; "
+-            "img-src 'self' data: https:; "
+-            "connect-src 'self' wss://; "
+-            "font-src 'self'; "
+-            "frame-ancestors 'none'; "
+-            "base-uri 'self'; "
+-            "object-src 'none'"
+-        )
+-        response.headers["Content-Security-Policy"] = csp
+-        
+-        # HSTS (only in production with HTTPS)
+-        if settings.ENV == "production":
+-            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+-        
+-        return response
+-
+-
+-class IPFilterMiddleware(BaseHTTPMiddleware):
+-    """IP allow/deny list filtering."""
+-    
+-    def __init__(self, app, allow_ips: list = None, deny_ips: list = None):
+-        super().__init__(app)
+-        self.allow_ips = allow_ips or []
+-        self.deny_ips = deny_ips or []
+-    
+-    async def dispatch(self, request: Request, call_next):
+-        client_ip = request.client.host if request.client else "unknown"
+-        
+-        # Check deny list first
+-        if self.deny_ips and client_ip in self.deny_ips:
+-            return JSONErrorResponse(
+-                error="IP_ADDRESS_DENIED",
+-                message="Your IP address has been denied access."
+-            ), 403
+-        
+-        # Check allow list (if specified)
+-        if self.allow_ips and client_ip not in self.allow_ips:
+-            return JSONErrorResponse(
+-                error="IP_ADDRESS_NOT_ALLOWED",
+-                message="Your IP address is not allowed to access this API."
+-            ), 403
+-        
+-        return await call_next(request)
+-
+-
+-class RateLimitMiddleware(BaseHTTPMiddleware):
+-    """Simple rate limiting middleware using in-memory store."""
+-    
+-    def __init__(self, app, limit: str = "100/minute", key_func: Callable = None):
+-        super().__init__(app)
+-        self.limit = limit
+-        self.key_func = key_func or self._default_key_func
+-        self._counters: Dict[str, list] = {}
+-    
+-    def _default_key_func(self, request: Request) -> str:
+-        """Default key function based on IP + endpoint."""
+-        ip = request.client.host if request.client else "unknown"
+-        path = request.url.path
+-        return f"{ip}:{path}"
+-    
+-    async def dispatch(self, request: Request, call_next):
+-        key = self.key_func(request)
+-        now = time.time()
+-        
+-        # Initialize counter if needed
+-        if key not in self._counters:
+-            self._counters[key] = []
+-        
+-        # Clean old entries
+-        self._counters[key] = [t for t in self._counters[key] if now - t < 60]
+-        
+-        # Check limit
+-        if len(self._counters[key]) >= 100:  # Simplified - real impl uses Redis
+-            return JSONErrorResponse(
+-                error="RATE_LIMIT_EXCEEDED",
+-                message="Too many requests. Please try again later."
+-            ), 429
+-        
+-        # Add current request
+-        self._counters[key].append(now)
+-        
+-        return await call_next(request)
+-
+-
+-class JSONErrorResponse:
+-    """Helper to create consistent JSON error responses."""
+-    
+-    def __init__(self, error: str, message: str, status_code: int = 400):
+-        self.error = error
+-        self.message = message
+-        self.status_code = status_code
+-    
+-    def __call__(self):
+-        return JSONResponse(
+-            status_code=self.status_code,
+-            content={
+-                "error": self.error,
+-                "message": self.message,
+-                "success": False
+-            }
+-        )
+-
+-
+-# Register middlewares function
+-def register_middlewares(app: Any) -> None:
+-    """Register all middleware chains in the correct order."""
+-    # CORS - first
+-    app.add_middleware(
+-        CORSMiddleware,
+-        allow_origins=settings.CORS_ORIGINS,
+-        allow_credentials=True,
+-        allow_methods=["*"],
+-        allow_headers=["*"],
+-    )
+-    
+-    # Trusted host
+-    if settings.ALLOWED_HOSTS:
+-        app.add_middleware(
+-            TrustedHostMiddleware,
+-            allowed_hosts=settings.ALLOWED_HOSTS
+-        )
+-    
+-    # Security headers
+-    app.add_middleware(SecurityHeadersMiddleware)
+-    
+-    # Request ID
+-    app.add_middleware(RequestIDMiddleware)
+-    
+-    # Rate limiting
+-    app.add_middleware(
+-        RateLimitMiddleware,
+-        limit=settings.RATE_LIMIT_DEFAULT,
+-    )
+-
+-
+-# Export middleware classes
+-__all__ = [
+-    "RequestIDMiddleware", "SecurityHeadersMiddleware", 
+-    "IPFilterMiddleware", "RateLimitMiddleware",
+-    "RequestContext", "set_request_context", "get_request_context",
+-    "register_middlewares"
+-]
+\ No newline at end of file
+diff --git a/backend/app/core/middleware/__init__.py b/backend/app/core/middleware/__init__.py
+new file mode 100644
+index 0000000..216f24a
+--- /dev/null
++++ b/backend/app/core/middleware/__init__.py
+@@ -0,0 +1,55 @@
++"""Middleware chain (architecture 3.1 ``core/middleware/``).
++
++Order, outermost first:
++
++    RequestID -> SecurityHeaders -> CORS -> TrustedHost -> IPFilter
++      -> RateLimit -> BodyGuard -> AuditContext -> application
++
++CORS sits outside the filters so that 403/413/429 answers still carry CORS
++headers (otherwise browsers report them as opaque network errors).
++"""
++from __future__ import annotations
++
++from fastapi import FastAPI
++from starlette.middleware.cors import CORSMiddleware
++from starlette.middleware.trustedhost import TrustedHostMiddleware
++
++from app.core.config import settings
++from app.core.middleware.audit_context import AuditContextMiddleware
++from app.core.middleware.body_guard import BodyGuardMiddleware
++from app.core.middleware.ip_filter import IPFilterMiddleware
++from app.core.middleware.rate_limit import RateLimitMiddleware
++from app.core.middleware.request_id import RequestIDMiddleware
++from app.core.middleware.security_headers import SecurityHeadersMiddleware
++
++
++def register_middlewares(app: FastAPI) -> None:
++    """Register the whole chain once. (``add_middleware``: last added = outermost.)"""
++    app.add_middleware(AuditContextMiddleware)
++    app.add_middleware(BodyGuardMiddleware)
++    app.add_middleware(RateLimitMiddleware)
++    app.add_middleware(IPFilterMiddleware, allow_ips=settings.IP_ALLOW_LIST,
++                       deny_ips=settings.IP_DENY_LIST)
++    if settings.ALLOWED_HOSTS:
++        app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.ALLOWED_HOSTS)
++    app.add_middleware(
++        CORSMiddleware,
++        allow_origins=settings.CORS_ORIGINS,
++        allow_credentials=True,
++        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
++        allow_headers=["Authorization", "Content-Type", "X-Request-ID",
++                       "X-Correlation-ID", "Idempotency-Key", "If-Match",
++                       "X-Device-Fingerprint", "X-Device-MAC", "X-Device-Nonce",
++                       "X-Device-Timestamp", "X-Device-Signature",
++                       "X-Device-MAC-Source", "X-Requested-With"],
++        expose_headers=["X-Request-ID", "ETag", "Retry-After"],
++    )
++    app.add_middleware(SecurityHeadersMiddleware)
++    app.add_middleware(RequestIDMiddleware)
++
++
++__all__ = [
++    "register_middlewares", "RequestIDMiddleware", "SecurityHeadersMiddleware",
++    "IPFilterMiddleware", "RateLimitMiddleware", "BodyGuardMiddleware",
++    "AuditContextMiddleware",
++]
+diff --git a/backend/app/core/middleware/_http.py b/backend/app/core/middleware/_http.py
+new file mode 100644
+index 0000000..d71aa79
+--- /dev/null
++++ b/backend/app/core/middleware/_http.py
+@@ -0,0 +1,58 @@
++"""Small helpers shared by the pure-ASGI middlewares."""
++from __future__ import annotations
++
++import ipaddress
++from typing import Iterable, Optional
++
++from starlette.datastructures import Headers
++from starlette.responses import JSONResponse
++from starlette.types import Receive, Scope, Send
++
++from app.core.config import settings
++from app.core.context import get_context
++
++
++async def send_error(
++    scope: Scope, receive: Receive, send: Send, *, status: int, code: str,
++    message: str, headers: Optional[dict[str, str]] = None,
++) -> None:
++    """Send the platform-wide error body (same shape as ``core.errors``)."""
++    body = {"error": code, "message": message, "success": False,
++            "request_id": get_context().request_id}
++    await JSONResponse(body, status_code=status, headers=headers)(scope, receive, send)
++
++
++def parse_networks(values: Iterable[str]):
++    nets = []
++    for v in values:
++        try:
++            nets.append(ipaddress.ip_network(v.strip(), strict=False))
++        except ValueError:
++            continue
++    return nets
++
++
++def ip_in(ip: str, networks) -> bool:
++    try:
++        addr = ipaddress.ip_address(ip)
++    except ValueError:
++        return False
++    return any(addr in n for n in networks)
++
++
++def client_ip(scope: Scope) -> str:
++    """Peer address; ``X-Forwarded-For`` is honoured only from TRUSTED_PROXIES.
++
++    Trusting the header unconditionally lets any client spoof its IP and
++    bypass rate limiting / IP rules / audit attribution.
++    """
++    peer = (scope.get("client") or ("unknown", 0))[0]
++    if settings.TRUSTED_PROXIES and ip_in(peer, parse_networks(settings.TRUSTED_PROXIES)):
++        xff = Headers(scope=scope).get("x-forwarded-for")
++        if xff:
++            # right-most entry that is not itself a trusted proxy
++            nets = parse_networks(settings.TRUSTED_PROXIES)
++            for hop in reversed([h.strip() for h in xff.split(",") if h.strip()]):
++                if not ip_in(hop, nets):
++                    return hop
++    return peer
+diff --git a/backend/app/core/middleware/audit_context.py b/backend/app/core/middleware/audit_context.py
+new file mode 100644
+index 0000000..a6cccaa
+--- /dev/null
++++ b/backend/app/core/middleware/audit_context.py
+@@ -0,0 +1,39 @@
++"""Fills network/device identity into the request context (architecture 3.1).
++
++The identity that ends up in audit rows always comes from here (headers /
++socket), never from a request body. ``mac_verified`` stays False until the
++device-binding step validates the HMAC signature (ADR-08: MAC is a forensic
++signal, not a security control).
++"""
++from __future__ import annotations
++
++import re
++
++from starlette.datastructures import Headers
++from starlette.types import ASGIApp, Receive, Scope, Send
++
++from app.core.context import get_context
++from app.core.middleware._http import client_ip
++
++_MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
++_FP_RE = re.compile(r"^[A-Za-z0-9+/=_\-]{16,255}$")
++
++
++class AuditContextMiddleware:
++    def __init__(self, app: ASGIApp) -> None:
++        self.app = app
++
++    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
++        if scope["type"] in ("http", "websocket"):
++            h = Headers(scope=scope)
++            ctx = get_context()
++            ctx.ip = client_ip(scope)
++            ctx.user_agent = (h.get("user-agent") or "")[:512] or None
++            mac = h.get("x-device-mac")
++            if mac and _MAC_RE.match(mac):
++                ctx.mac_address = mac.upper().replace("-", ":")
++            fp = h.get("x-device-fingerprint")
++            if fp and _FP_RE.match(fp):
++                ctx.device_fingerprint = fp
++            ctx.correlation_id = h.get("x-correlation-id") or ctx.request_id
++        await self.app(scope, receive, send)
+diff --git a/backend/app/core/middleware/body_guard.py b/backend/app/core/middleware/body_guard.py
+new file mode 100644
+index 0000000..73b4745
+--- /dev/null
++++ b/backend/app/core/middleware/body_guard.py
+@@ -0,0 +1,77 @@
++"""Request body size guard (architecture 3.1 ``body_guard``).
++
++Checks ``Content-Length`` up front and also counts streamed bytes, so
++chunked uploads cannot bypass the limit. Upload endpoints (``/files``) use
++``MAX_UPLOAD_SIZE`` instead of the small JSON limit.
++"""
++from __future__ import annotations
++
++from starlette.datastructures import Headers
++from starlette.types import ASGIApp, Message, Receive, Scope, Send
++
++from app.core.config import settings
++from app.core.middleware._http import send_error
++
++_UPLOAD_PREFIXES = ("/api/v1/files",)
++
++
++class _TooLarge(Exception):
++    pass
++
++
++class BodyGuardMiddleware:
++    def __init__(self, app: ASGIApp) -> None:
++        self.app = app
++
++    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
++        if scope["type"] != "http" or scope["method"] in ("GET", "HEAD", "OPTIONS"):
++            await self.app(scope, receive, send)
++            return
++        limit = (settings.MAX_UPLOAD_SIZE
++                 if scope.get("path", "").startswith(_UPLOAD_PREFIXES)
++                 else settings.MAX_BODY_SIZE)
++        declared = Headers(scope=scope).get("content-length")
++        if declared is not None:
++            try:
++                too_big = int(declared) > limit
++            except ValueError:
++                too_big = True
++            if too_big:
++                await send_error(scope, receive, send, status=413,
++                                 code="PAYLOAD_TOO_LARGE",
++                                 message="حجم درخواست بیش از حد مجاز است.")
++                return
++
++        received = 0
++        exceeded = False
++        started = False
++
++        async def counting_receive() -> Message:
++            nonlocal received, exceeded
++            message = await receive()
++            if message["type"] == "http.request":
++                received += len(message.get("body", b""))
++                if received > limit:
++                    exceeded = True
++                    raise _TooLarge()
++            return message
++
++        async def tracking_send(message: Message) -> None:
++            nonlocal started
++            if exceeded:
++                # FastAPI wraps any body-read exception into its own 400; once the
++                # limit was crossed that response is wrong, so swallow it and let
++                # the 413 below win.
++                return
++            if message["type"] == "http.response.start":
++                started = True
++            await send(message)
++
++        try:
++            await self.app(scope, counting_receive, tracking_send)
++        except _TooLarge:
++            pass
++        if exceeded and not started:
++            await send_error(scope, receive, send, status=413,
++                             code="PAYLOAD_TOO_LARGE",
++                             message="حجم درخواست بیش از حد مجاز است.")
+diff --git a/backend/app/core/middleware/ip_filter.py b/backend/app/core/middleware/ip_filter.py
+new file mode 100644
+index 0000000..01f1f3a
+--- /dev/null
++++ b/backend/app/core/middleware/ip_filter.py
+@@ -0,0 +1,36 @@
++"""IP allow / deny lists (CIDR aware). Deny wins over allow."""
++from __future__ import annotations
++
++from starlette.types import ASGIApp, Receive, Scope, Send
++
++from app.core.middleware._http import client_ip, ip_in, parse_networks, send_error
++
++
++class IPFilterMiddleware:
++    def __init__(self, app: ASGIApp, allow_ips: list[str] | None = None,
++                 deny_ips: list[str] | None = None) -> None:
++        self.app = app
++        self.allow = parse_networks(allow_ips or [])
++        self.deny = parse_networks(deny_ips or [])
++
++    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
++        if scope["type"] not in ("http", "websocket") or not (self.allow or self.deny):
++            await self.app(scope, receive, send)
++            return
++        ip = client_ip(scope)
++        if self.deny and ip_in(ip, self.deny):
++            await self._reject(scope, receive, send, "IP_ADDRESS_DENIED",
++                               "آدرس IP شما مسدود شده است.")
++            return
++        if self.allow and not ip_in(ip, self.allow):
++            await self._reject(scope, receive, send, "IP_ADDRESS_NOT_ALLOWED",
++                               "دسترسی از این آدرس IP مجاز نیست.")
++            return
++        await self.app(scope, receive, send)
++
++    @staticmethod
++    async def _reject(scope, receive, send, code, message) -> None:
++        if scope["type"] == "websocket":
++            await send({"type": "websocket.close", "code": 4403})
++            return
++        await send_error(scope, receive, send, status=403, code=code, message=message)
+diff --git a/backend/app/core/middleware/rate_limit.py b/backend/app/core/middleware/rate_limit.py
+new file mode 100644
+index 0000000..ff403f1
+--- /dev/null
++++ b/backend/app/core/middleware/rate_limit.py
+@@ -0,0 +1,136 @@
++"""L7 rate limiting (architecture 1.1 / 11).
++
++* Limits come from settings (``RATE_LIMIT_DEFAULT`` / ``RATE_LIMIT_AUTH``) -
++  the old middleware ignored them and hard-coded 100.
++* Backend: Redis when reachable (shared by all workers), otherwise a bounded
++  in-process sliding window. The in-memory backend evicts idle keys, so it can
++  no longer grow without bound.
++* Keyed by client IP + bucket (auth endpoints have their own, stricter bucket)
++  - not by path, which let an attacker multiply their quota by rotating URLs.
++"""
++from __future__ import annotations
++
++import logging
++import time
++from collections import deque
++from typing import Optional, Protocol
++
++from starlette.types import ASGIApp, Receive, Scope, Send
++
++from app.core.config import settings
++from app.core.middleware._http import client_ip, send_error
++
++logger = logging.getLogger("core.rate_limit")
++
++_PERIODS = {"second": 1, "minute": 60, "hour": 3600, "day": 86400}
++_AUTH_PREFIXES = (
++    "/api/v1/auth/login", "/api/v1/auth/register", "/api/v1/auth/refresh",
++    "/api/v1/auth/password", "/api/v1/auth/mfa", "/api/v1/auth/sso",
++)
++
++
++def parse_limit(spec: str) -> tuple[int, int]:
++    """``"100/minute"`` -> (100, 60)."""
++    try:
++        count, period = spec.strip().split("/")
++        return int(count), _PERIODS[period.strip().lower()]
++    except (ValueError, KeyError):
++        raise ValueError(f"invalid rate limit spec: {spec!r} (expected N/second|minute|hour|day)")
++
++
++class Limiter(Protocol):
++    async def hit(self, key: str, limit: int, window: int) -> tuple[bool, int]:
++        """Register a hit. Returns (allowed, retry_after_seconds)."""
++
++
++class MemoryLimiter:
++    def __init__(self, max_keys: int = 50_000) -> None:
++        self._hits: dict[str, deque[float]] = {}
++        self._max_keys = max_keys
++        self._last_sweep = time.monotonic()
++
++    async def hit(self, key: str, limit: int, window: int) -> tuple[bool, int]:
++        now = time.monotonic()
++        self._sweep(now, window)
++        q = self._hits.setdefault(key, deque())
++        while q and now - q[0] >= window:
++            q.popleft()
++        if len(q) >= limit:
++            return False, max(1, int(window - (now - q[0])) + 1)
++        q.append(now)
++        return True, 0
++
++    def _sweep(self, now: float, window: int) -> None:
++        if now - self._last_sweep < 30 and len(self._hits) < self._max_keys:
++            return
++        self._last_sweep = now
++        for k in [k for k, q in self._hits.items() if not q or now - q[-1] >= max(window, 60)]:
++            del self._hits[k]
++        if len(self._hits) >= self._max_keys:  # hard cap: drop oldest half
++            for k in list(self._hits)[: self._max_keys // 2]:
++                del self._hits[k]
++
++
++class RedisLimiter:
++    """Fixed-window counter shared across workers; falls back on any error."""
++
++    def __init__(self, url: str, fallback: Limiter) -> None:
++        import redis.asyncio as aioredis
++
++        self._redis = aioredis.from_url(url, socket_connect_timeout=0.5, socket_timeout=0.5)
++        self._fallback = fallback
++
++    async def hit(self, key: str, limit: int, window: int) -> tuple[bool, int]:
++        try:
++            bucket = int(time.time()) // window
++            rkey = f"rl:{key}:{bucket}"
++            pipe = self._redis.pipeline()
++            pipe.incr(rkey)
++            pipe.expire(rkey, window + 1)
++            count, _ = await pipe.execute()
++            if count > limit:
++                return False, window - (int(time.time()) % window) or 1
++            return True, 0
++        except Exception as exc:  # Redis down must not take the API down
++            logger.warning("redis rate limiter unavailable (%s); using in-memory", exc)
++            return await self._fallback.hit(key, limit, window)
++
++
++def build_limiter() -> Limiter:
++    memory = MemoryLimiter()
++    if settings.ENV == "testing":
++        return memory
++    try:
++        return RedisLimiter(settings.redis_url, memory)
++    except Exception:  # redis package missing / bad URL
++        return memory
++
++
++class RateLimitMiddleware:
++    def __init__(self, app: ASGIApp, limiter: Optional[Limiter] = None,
++                 default: Optional[str] = None, auth: Optional[str] = None) -> None:
++        self.app = app
++        self.limiter = limiter or build_limiter()
++        self.default = parse_limit(default or settings.RATE_LIMIT_DEFAULT)
++        self.auth = parse_limit(auth or settings.RATE_LIMIT_AUTH)
++
++    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
++        if (scope["type"] != "http" or not settings.RATE_LIMIT_ENABLED
++                or scope["method"] == "OPTIONS"):
++            await self.app(scope, receive, send)
++            return
++        path = scope.get("path", "")
++        if path in ("/health", "/ready"):
++            await self.app(scope, receive, send)
++            return
++        bucket, (limit, window) = (("auth", self.auth) if path.startswith(_AUTH_PREFIXES)
++                                   else ("default", self.default))
++        allowed, retry_after = await self.limiter.hit(
++            f"{bucket}:{client_ip(scope)}", limit, window)
++        if not allowed:
++            await send_error(
++                scope, receive, send, status=429, code="RATE_LIMIT_EXCEEDED",
++                message="درخواست‌های بیش از حد ارسال شده است. لطفاً کمی بعد تلاش کنید.",
++                headers={"Retry-After": str(retry_after)})
++            return
++        await self.app(scope, receive, send)
+diff --git a/backend/app/core/middleware/request_id.py b/backend/app/core/middleware/request_id.py
+new file mode 100644
+index 0000000..0f59c3c
+--- /dev/null
++++ b/backend/app/core/middleware/request_id.py
+@@ -0,0 +1,39 @@
++"""Creates the per-request context and the ``X-Request-ID`` header."""
++from __future__ import annotations
++
++import re
++from uuid import uuid4
++
++from starlette.datastructures import Headers, MutableHeaders
++from starlette.types import ASGIApp, Message, Receive, Scope, Send
++
++from app.core.context import RequestContext, reset_context, set_context
++
++_SAFE_ID = re.compile(r"^[A-Za-z0-9\-_.]{8,64}$")
++
++
++class RequestIDMiddleware:
++    def __init__(self, app: ASGIApp) -> None:
++        self.app = app
++
++    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
++        if scope["type"] not in ("http", "websocket"):
++            await self.app(scope, receive, send)
++            return
++        incoming = Headers(scope=scope).get("x-request-id", "")
++        # Accept a client id only if it is short/safe (log-injection guard).
++        request_id = incoming if _SAFE_ID.match(incoming) else str(uuid4())
++        ctx = RequestContext(request_id=request_id, path=scope.get("path"),
++                             method=scope.get("method"))
++        scope.setdefault("state", {})["request_id"] = request_id
++        token = set_context(ctx)
++
++        async def send_wrapper(message: Message) -> None:
++            if message["type"] == "http.response.start":
++                MutableHeaders(scope=message)["X-Request-ID"] = request_id
++            await send(message)
++
++        try:
++            await self.app(scope, receive, send_wrapper)
++        finally:
++            reset_context(token)
+diff --git a/backend/app/core/middleware/security_headers.py b/backend/app/core/middleware/security_headers.py
+new file mode 100644
+index 0000000..d0793fb
+--- /dev/null
++++ b/backend/app/core/middleware/security_headers.py
+@@ -0,0 +1,46 @@
++"""Security headers on every HTTP response (architecture 11 / 1.5)."""
++from __future__ import annotations
++
++from starlette.datastructures import MutableHeaders
++from starlette.types import ASGIApp, Message, Receive, Scope, Send
++
++from app.core.config import settings
++
++# Pure JSON API: nothing may be loaded or framed from an API response.
++_API_CSP = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
++# Swagger UI / ReDoc need inline scripts and a CDN (non-production only).
++_DOCS_CSP = (
++    "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
++    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
++    "img-src 'self' data: https://fastapi.tiangolo.com; frame-ancestors 'none'"
++)
++_DOCS_PATHS = ("/docs", "/redoc")
++
++
++class SecurityHeadersMiddleware:
++    def __init__(self, app: ASGIApp) -> None:
++        self.app = app
++
++    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
++        if scope["type"] != "http":
++            await self.app(scope, receive, send)
++            return
++        path = scope.get("path", "")
++        is_docs = (not settings.is_production) and path.startswith(_DOCS_PATHS)
++
++        async def send_wrapper(message: Message) -> None:
++            if message["type"] == "http.response.start":
++                h = MutableHeaders(scope=message)
++                h["X-Content-Type-Options"] = "nosniff"
++                h["X-Frame-Options"] = "DENY"
++                h["Referrer-Policy"] = "strict-origin-when-cross-origin"
++                h["Cross-Origin-Resource-Policy"] = "same-site"
++                h["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
++                h["Content-Security-Policy"] = _DOCS_CSP if is_docs else _API_CSP
++                if not is_docs:
++                    h.setdefault("Cache-Control", "no-store")  # tokens/PII in bodies
++                if settings.is_production:
++                    h["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
++            await send(message)
++
++        await self.app(scope, receive, send_wrapper)
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 48e5078..a6ed84d 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -5,68 +5,60 @@ Architecture: Modular Monolith with Defense in Depth
+ Version: 2.0
+ """
+ 
++import logging
+ from contextlib import asynccontextmanager
+-from fastapi import FastAPI, Request, Response
+-from fastapi.middleware.cors import CORSMiddleware
+-from fastapi.middleware.trustedhost import TrustedHostMiddleware
+-from fastapi.responses import JSONResponse
++
+ import uvicorn
++from fastapi import FastAPI
++from fastapi.responses import JSONResponse
++from sqlalchemy import text
+ 
+ from app.core.config import settings
+-from app.core.middleware import register_middlewares
++from app.core.database import dispose_engine, engine
+ from app.core.errors import register_exception_handlers
+ from app.core.events import event_bus
++from app.core.middleware import register_middlewares
+ from app.modules import auth, rbac, groups, goals, sharing, chat, inbox, \
+                         reporting, notification, audit, ssoldap, files
+ 
++logging.basicConfig(level=settings.LOG_LEVEL, format=settings.LOG_FORMAT)
++
+ # Module order matters for initialization
+ MODULES = [auth, rbac, groups, goals, sharing,
+            chat, inbox, reporting, notification, audit, ssoldap, files]
+ 
++
+ @asynccontextmanager
+ async def lifespan(app: FastAPI):
+     """Application lifespan manager."""
+-    # Initialize event bus subscriptions (modules without handlers are skipped)
++    # Event bus subscriptions (modules without handlers are skipped)
+     for m in MODULES:
+         register = getattr(m, "register_event_handlers", None)
+         if callable(register):
+             register(event_bus)
+ 
+-    # Startup checks
+     yield
+ 
+-    # Shutdown gracefully
++    # Graceful shutdown: return pooled connections to PostgreSQL
+     await shutdown_gracefully()
+ 
+-app = FastAPI(
+-    title="Planner Enterprise API",
+-    version="1.0.0",
+-    lifespan=lifespan,
+-    docs_url="/docs" if settings.ENV != "production" else None,
+-    redoc_url="/redoc" if settings.ENV != "production" else None,
+-    openapi_url="/openapi.json" if settings.ENV != "production" else None,
+-)
+ 
+-# --- Security Middleware ---
+-# Order matters: first line of defense
+-app.add_middleware(
+-    TrustedHostMiddleware,
+-    allowed_hosts=settings.ALLOWED_HOSTS
+-)
++_docs_enabled = not settings.is_production
+ 
+-# CORS - Configure based on environment
+-app.add_middleware(
+-    CORSMiddleware,
+-    allow_origins=settings.CORS_ORIGINS,
+-    allow_credentials=True,
+-    allow_methods=["*"],
+-    allow_headers=["*"],
++app = FastAPI(
++    title=settings.APP_NAME,
++    version=settings.APP_VERSION,
++    lifespan=lifespan,
++    root_path=settings.ROOT_PATH,
++    docs_url="/docs" if _docs_enabled else None,
++    redoc_url="/redoc" if _docs_enabled else None,
++    openapi_url="/openapi.json" if _docs_enabled else None,
+ )
+ 
+-# --- Register Middlewares (Request Processing Chain) ---
++# --- Middleware chain (single place; order documented in core/middleware) ---
+ register_middlewares(app)
+ 
+-# --- Register Exception Handlers ---
++# --- Exception handlers ---
+ register_exception_handlers(app)
+ 
+ # --- Include Module Routers ---
+@@ -80,26 +72,38 @@ for m in MODULES:
+ 
+ async def shutdown_gracefully():
+     """Graceful shutdown routine."""
+-    # Close DB connections, Redis, etc.
+-    # Would integrate with actual services here
+-    pass
++    await dispose_engine()
+ 
+-# Health check endpoint
++
++# Liveness: process is up (no dependencies touched)
+ @app.get("/health", include_in_schema=False)
+ async def health_check():
+     return {
+         "status": "healthy",
+         "service": "planner-enterprise-api",
+-        "version": "1.0.0",
+-        "modules": [m.__name__ for m in MODULES]
++        "version": settings.APP_VERSION,
++        "modules": [m.__name__ for m in MODULES],
+     }
+ 
++
++# Readiness: dependencies reachable (used by the load balancer)
++@app.get("/ready", include_in_schema=False)
++async def readiness_check():
++    try:
++        async with engine.connect() as conn:
++            await conn.execute(text("SELECT 1"))
++    except Exception:
++        logging.getLogger("app.health").exception("readiness: database unreachable")
++        return JSONResponse(status_code=503, content={"status": "unavailable", "database": "down"})
++    return {"status": "ready", "database": "up"}
++
++
+ # Root endpoint
+ @app.get("/", include_in_schema=False)
+ async def root():
+     return {
+         "message": "Planner Enterprise API",
+-        "version": "1.0.0",
++        "version": settings.APP_VERSION,
+         "docs": "/docs" if settings.ENV != "production" else "disabled",
+         "endpoints": "/api/v1/auth, /api/v1/goals, /api/v1/groups, etc."
+     }
+@@ -107,8 +111,8 @@ async def root():
+ if __name__ == "__main__":
+     uvicorn.run(
+         "app.main:app",
+-        host="0.0.0.0",
+-        port=8000,
++        host=settings.HOST,
++        port=settings.PORT,
+         reload=settings.ENV == "development",
+         access_log=False
+     )
+\ No newline at end of file
+diff --git a/backend/pytest.ini b/backend/pytest.ini
+new file mode 100644
+index 0000000..68a11f1
+--- /dev/null
++++ b/backend/pytest.ini
+@@ -0,0 +1,9 @@
++[pytest]
++asyncio_mode = auto
++asyncio_default_fixture_loop_scope = function
++testpaths = tests
++markers =
++    integration: needs a reachable PostgreSQL (SQLALCHEMY_DATABASE_URI)
++filterwarnings =
++    ignore::DeprecationWarning:passlib.*
++    ignore::DeprecationWarning:jose.*
+diff --git a/backend/tests/conftest.py b/backend/tests/conftest.py
+new file mode 100644
+index 0000000..008d383
+--- /dev/null
++++ b/backend/tests/conftest.py
+@@ -0,0 +1,11 @@
++"""Shared test setup. Environment is fixed *before* ``app`` is imported."""
++import os
++
++os.environ.setdefault("ENV", "testing")
++os.environ.setdefault("DEBUG", "false")  # a local .env must not leak into tests
++os.environ.setdefault("SECRET_KEY", "test-secret-key-that-is-at-least-32-chars-long")
++os.environ.setdefault(
++    "SQLALCHEMY_DATABASE_URI",
++    "postgresql+asyncpg://admin:admin123@localhost:5432/planner_db",
++)
++os.environ.setdefault("RATE_LIMIT_ENABLED", "true")
+diff --git a/backend/app/core/_/__init__.py b/backend/tests/core/__init__.py
+similarity index 100%
+rename from backend/app/core/_/__init__.py
+rename to backend/tests/core/__init__.py
+diff --git a/backend/tests/core/test_config.py b/backend/tests/core/test_config.py
+new file mode 100644
+index 0000000..7911be3
+--- /dev/null
++++ b/backend/tests/core/test_config.py
+@@ -0,0 +1,54 @@
++import pytest
++from pydantic import ValidationError
++
++from app.core.config import Settings
++
++BASE = dict(
++    SECRET_KEY="x" * 40,
++    SQLALCHEMY_DATABASE_URI="postgresql+asyncpg://u:p@localhost/db",
++)
++
++
++def make(**kw):
++    return Settings(_env_file=None, **{**BASE, **kw})
++
++
++def test_short_secret_key_rejected():
++    with pytest.raises(ValidationError):
++        make(SECRET_KEY="short")
++
++
++def test_unknown_algorithm_rejected():
++    with pytest.raises(ValidationError):
++        make(ALGORITHM="none")
++
++
++def test_rs256_requires_keys():
++    with pytest.raises(ValidationError):
++        make(ALGORITHM="RS256")
++
++
++def test_production_rejects_insecure_defaults():
++    with pytest.raises(ValidationError) as e:
++        make(ENV="production")  # ALLOWED_HOSTS '*', no DEK/pepper
++    msg = str(e.value)
++    assert "ALLOWED_HOSTS" in msg and "DATA_ENCRYPTION_KEY" in msg and "NATIONAL_ID_PEPPER" in msg
++
++
++def test_production_ok_when_hardened():
++    s = make(ENV="production", ALLOWED_HOSTS=["api.corp.local"],
++             DATA_ENCRYPTION_KEY="a" * 44, NATIONAL_ID_PEPPER="p" * 32)
++    assert s.is_production
++
++
++def test_log_format_is_valid():
++    import logging
++    s = make()
++    rec = logging.LogRecord("n", logging.INFO, "f.py", 1, "hello", None, None)
++    assert "INFO" in logging.Formatter(s.LOG_FORMAT).format(rec)
++
++
++def test_redis_url_and_ws_origins_fallback():
++    s = make(REDIS_HOST="r", REDIS_PORT=1, REDIS_DB=2)
++    assert s.redis_url == "redis://r:1/2"
++    assert s.ws_allowed_origins == s.CORS_ORIGINS
+diff --git a/backend/tests/core/test_context.py b/backend/tests/core/test_context.py
+new file mode 100644
+index 0000000..1b33c4d
+--- /dev/null
++++ b/backend/tests/core/test_context.py
+@@ -0,0 +1,20 @@
++import asyncio
++
++from app.core.context import RequestContext, get_context, reset_context, set_context
++
++
++async def _worker(name: str, delay: float):
++    tok = set_context(RequestContext(request_id=name, user_id=name))
++    await asyncio.sleep(delay)
++    seen = get_context().user_id
++    reset_context(tok)
++    return seen
++
++
++async def test_concurrent_contexts_do_not_leak():
++    results = await asyncio.gather(*[_worker(f"u{i}", 0.01 * (5 - i)) for i in range(5)])
++    assert results == [f"u{i}" for i in range(5)]
++
++
++def test_empty_context_outside_request():
++    assert get_context().user_id is None
+diff --git a/backend/tests/core/test_events.py b/backend/tests/core/test_events.py
+new file mode 100644
+index 0000000..9529554
+--- /dev/null
++++ b/backend/tests/core/test_events.py
+@@ -0,0 +1,152 @@
++"""Event bus + transactional outbox (architecture 2.3). Needs PostgreSQL."""
++from __future__ import annotations
++
++import os
++from uuid import uuid4
++
++import pytest
++from sqlalchemy import select, text
++from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
++
++from app.core.context import RequestContext, reset_context, set_context
++from app.core.events.bus import DomainEvent, EventBus
++from app.core.events.dispatcher import MAX_ATTEMPTS, dispatch_pending_outbox_messages
++from app.core.events.outbox import OutboxMessage
++
++pytestmark = pytest.mark.integration
++
++
++@pytest.fixture
++async def factory():
++    engine = create_async_engine(os.environ["SQLALCHEMY_DATABASE_URI"])
++    try:
++        async with engine.connect() as c:
++            await c.execute(text("SELECT 1 FROM core.outbox_messages LIMIT 1"))
++    except Exception as exc:  # no DB / migrations not applied
++        await engine.dispose()
++        pytest.skip(f"PostgreSQL with migrations not available: {exc}")
++    yield async_sessionmaker(engine, expire_on_commit=False)
++    await engine.dispose()
++
++
++def _ev(kind: str, **payload) -> DomainEvent:
++    return DomainEvent(event_type=kind, payload=payload)
++
++
++async def _row(factory, event_id):
++    async with factory() as s:
++        return (await s.execute(select(OutboxMessage).where(
++            OutboxMessage.event_id == event_id))).scalar_one_or_none()
++
++
++async def test_outbox_row_is_atomic_with_transaction(factory):
++    bus = EventBus()
++    kept, dropped = _ev("t.kept"), _ev("t.dropped")
++    async with factory() as s:
++        await bus.publish(kept, s)
++        await s.commit()
++    async with factory() as s:
++        await bus.publish(dropped, s)
++        await s.rollback()  # business transaction fails -> no event may survive
++    assert await _row(factory, kept.event_id) is not None
++    assert await _row(factory, dropped.event_id) is None
++
++
++async def test_transactional_handler_runs_inline_and_is_not_replayed(factory):
++    bus, calls = EventBus(), []
++
++    async def inline(event, session):
++        calls.append(("inline", event.event_id))
++
++    bus.subscribe("t.audit", inline)  # default: same transaction
++    ev = _ev("t.audit")
++    async with factory() as s:
++        await bus.publish(ev, s)
++        await s.commit()
++    assert calls == [("inline", ev.event_id)]
++
++    # Dispatcher must not re-run transactional handlers (old bug: duplicate audit rows)
++    import app.core.events.dispatcher as d
++    original, d.event_bus = d.event_bus, bus
++    try:
++        async with factory() as s:
++            await dispatch_pending_outbox_messages(s, batch_size=1000)
++    finally:
++        d.event_bus = original
++    assert len(calls) == 1
++    assert (await _row(factory, ev.event_id)).dispatched_at is not None
++
++
++async def test_handler_failure_rolls_back_publish(factory):
++    bus = EventBus()
++
++    async def bad(event, session):
++        raise RuntimeError("boom")
++
++    bus.subscribe("t.bad", bad)
++    ev = _ev("t.bad")
++    async with factory() as s:
++        with pytest.raises(RuntimeError):
++            await bus.publish(ev, s)
++        await s.rollback()
++    assert await _row(factory, ev.event_id) is None
++
++
++async def test_async_consumer_delivery_retry_and_dead_letter(factory):
++    import app.core.events.dispatcher as d
++
++    bus, seen, fail = EventBus(), [], {"on": True}
++
++    async def notify(event, session):
++        if event.payload.get("poison") and fail["on"]:
++            raise RuntimeError("smtp down")
++        seen.append(event.event_id)
++
++    bus.subscribe("t.notify", notify, transactional=False)
++    good, poison = _ev("t.notify"), _ev("t.notify", poison=True)
++    async with factory() as s:
++        await bus.publish(good, s)
++        await bus.publish(poison, s)
++        await s.commit()
++    assert seen == []  # not delivered in-process
++
++    original, d.event_bus = d.event_bus, bus
++    try:
++        async with factory() as s:
++            await dispatch_pending_outbox_messages(s, batch_size=10_000)
++        # a poison row must not block the good one (SAVEPOINT per row)
++        assert good.event_id in seen and poison.event_id not in seen
++        bad = await _row(factory, poison.event_id)
++        assert bad.dispatched_at is None and bad.attempts == 1 and "smtp down" in bad.last_error
++
++        for _ in range(MAX_ATTEMPTS):  # keeps failing -> parked after MAX_ATTEMPTS
++            async with factory() as s:
++                await dispatch_pending_outbox_messages(s, batch_size=10_000)
++        assert (await _row(factory, poison.event_id)).attempts == MAX_ATTEMPTS
++
++        fail["on"] = False  # at-least-once: still nothing delivered twice for `good`
++        assert seen.count(good.event_id) == 1
++    finally:
++        d.event_bus = original
++
++
++async def test_context_fills_actor_and_correlation(factory):
++    bus, uid, cid = EventBus(), uuid4(), uuid4()
++    token = set_context(RequestContext(user_id=str(uid), correlation_id=str(cid)))
++    try:
++        ev = _ev("t.ctx")
++        async with factory() as s:
++            await bus.publish(ev, s)
++            await s.commit()
++    finally:
++        reset_context(token)
++    assert (await _row(factory, ev.event_id)).correlation_id == cid
++
++
++def test_subscribe_is_idempotent():
++    bus = EventBus()
++
++    async def h(e, s): ...
++
++    bus.subscribe("x", h); bus.subscribe("x", h)
++    assert bus.handlers_for("x", transactional=True) == [h]
+diff --git a/backend/tests/core/test_middleware.py b/backend/tests/core/test_middleware.py
+new file mode 100644
+index 0000000..ce86b83
+--- /dev/null
++++ b/backend/tests/core/test_middleware.py
+@@ -0,0 +1,186 @@
++import httpx
++import pytest
++from fastapi import FastAPI
++from fastapi.exceptions import RequestValidationError
++from pydantic import BaseModel
++from starlette.exceptions import HTTPException as StarletteHTTPException
++
++from app.core.context import get_context
++from app.core.errors import (APIError, NotFoundError, PermissionDeniedError,
++                             register_exception_handlers)
++from app.core.middleware.audit_context import AuditContextMiddleware
++from app.core.middleware.body_guard import BodyGuardMiddleware
++from app.core.middleware.ip_filter import IPFilterMiddleware
++from app.core.middleware.rate_limit import (MemoryLimiter, RateLimitMiddleware,
++                                            parse_limit)
++from app.core.middleware.request_id import RequestIDMiddleware
++from app.core.middleware.security_headers import SecurityHeadersMiddleware
++
++
++class Body(BaseModel):
++    n: int
++
++
++def make_app(*, rate="3/minute", auth="2/minute", deny=None, allow=None):
++    app = FastAPI()
++    register_exception_handlers(app)
++
++    @app.get("/ctx")
++    async def ctx():
++        c = get_context()
++        return {"rid": c.request_id, "ip": c.ip, "ua": c.user_agent, "mac": c.mac_address,
++                "fp": c.device_fingerprint}
++
++    @app.get("/api/v1/auth/login")
++    async def login():
++        return {}
++
++    @app.post("/echo")
++    async def echo(b: Body):
++        return b.model_dump()
++
++    @app.get("/boom")
++    async def boom():
++        raise RuntimeError("secret internals")
++
++    @app.get("/nf")
++    async def nf():
++        raise NotFoundError("گروه")
++
++    @app.get("/deny")
++    async def deny_():
++        raise PermissionDeniedError("CANNOT_SELF_ASSIGN")
++
++    app.add_middleware(AuditContextMiddleware)
++    app.add_middleware(BodyGuardMiddleware)
++    app.add_middleware(RateLimitMiddleware, limiter=MemoryLimiter(), default=rate, auth=auth)
++    app.add_middleware(IPFilterMiddleware, allow_ips=allow, deny_ips=deny)
++    app.add_middleware(SecurityHeadersMiddleware)
++    app.add_middleware(RequestIDMiddleware)
++    return app
++
++
++def client(app, **kw):
++    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app, raise_app_exceptions=False,
++                                                           client=("10.1.1.1", 5000)),
++                             base_url="http://t", **kw)
++
++
++async def test_request_id_and_security_headers():
++    async with client(make_app()) as c:
++        r = await c.get("/ctx", headers={"X-Request-ID": "abcdefgh-1234"})
++    assert r.headers["x-request-id"] == "abcdefgh-1234"
++    assert r.json()["rid"] == "abcdefgh-1234"
++    assert r.headers["x-content-type-options"] == "nosniff"
++    assert "default-src 'none'" in r.headers["content-security-policy"]
++    assert r.headers["cache-control"] == "no-store"
++
++
++async def test_unsafe_request_id_is_replaced():
++    async with client(make_app()) as c:
++        r = await c.get("/ctx", headers={"X-Request-ID": "bad id\r\nX: y"})
++    assert " " not in r.headers["x-request-id"]
++
++
++async def test_audit_context_from_headers_and_socket():
++    async with client(make_app()) as c:
++        r = await c.get("/ctx", headers={"User-Agent": "PlannerDesktop/2.0",
++                                          "X-Device-MAC": "00-1a-2b-3c-4d-5e",
++                                          "X-Device-Fingerprint": "a" * 32})
++    j = r.json()
++    assert j["ip"] == "10.1.1.1" and j["ua"] == "PlannerDesktop/2.0"
++    assert j["mac"] == "00:1A:2B:3C:4D:5E" and j["fp"] == "a" * 32
++
++
++async def test_invalid_mac_is_dropped():
++    async with client(make_app()) as c:
++        r = await c.get("/ctx", headers={"X-Device-MAC": "not-a-mac"})
++    assert r.json()["mac"] is None
++
++
++async def test_x_forwarded_for_ignored_from_untrusted_peer():
++    async with client(make_app()) as c:
++        r = await c.get("/ctx", headers={"X-Forwarded-For": "6.6.6.6"})
++    assert r.json()["ip"] == "10.1.1.1"
++
++
++async def test_rate_limit_default_bucket_and_retry_after():
++    async with client(make_app(rate="3/minute")) as c:
++        codes = [(await c.get("/ctx")).status_code for _ in range(5)]
++        blocked = await c.get("/ctx")
++    assert codes == [200, 200, 200, 429, 429]
++    assert int(blocked.headers["retry-after"]) >= 1
++    assert blocked.json()["error"] == "RATE_LIMIT_EXCEEDED"
++    assert "x-request-id" in blocked.headers  # outer middlewares still apply
++
++
++async def test_rate_limit_auth_bucket_is_separate_and_stricter():
++    async with client(make_app(rate="100/minute", auth="2/minute")) as c:
++        codes = [(await c.get("/api/v1/auth/login")).status_code for _ in range(3)]
++        other = (await c.get("/ctx")).status_code
++    assert codes == [200, 200, 429] and other == 200
++
++
++async def test_rate_limit_not_bypassed_by_changing_path():
++    async with client(make_app(rate="2/minute")) as c:
++        codes = [(await c.get(f"/ctx?x={i}")).status_code for i in range(4)]
++        codes.append((await c.get("/nf")).status_code)
++    assert codes[2:] == [429, 429, 429]
++
++
++async def test_ip_deny_cidr_returns_real_response_not_tuple():
++    async with client(make_app(deny=["10.1.0.0/16"])) as c:
++        r = await c.get("/ctx")
++    assert r.status_code == 403 and r.json()["error"] == "IP_ADDRESS_DENIED"
++
++
++async def test_ip_allow_list():
++    async with client(make_app(allow=["192.168.0.0/24"])) as c:
++        r = await c.get("/ctx")
++    assert r.status_code == 403 and r.json()["error"] == "IP_ADDRESS_NOT_ALLOWED"
++
++
++async def test_body_guard_content_length(monkeypatch):
++    from app.core.config import settings
++    monkeypatch.setattr(settings, "MAX_BODY_SIZE", 50)
++    async with client(make_app()) as c:
++        r = await c.post("/echo", content=b"x" * 200, headers={"Content-Type": "application/json"})
++        ok = await c.post("/echo", json={"n": 1})
++    assert r.status_code == 413 and r.json()["error"] == "PAYLOAD_TOO_LARGE"
++    assert ok.status_code == 200
++
++
++async def test_body_guard_streamed_without_content_length(monkeypatch):
++    from app.core.config import settings
++    monkeypatch.setattr(settings, "MAX_BODY_SIZE", 50)
++
++    async def gen():
++        for _ in range(10):
++            yield b'{"n": 1,' + b" " * 20
++
++    async with client(make_app()) as c:
++        r = await c.post("/echo", content=gen(), headers={"Content-Type": "application/json"})
++    assert r.status_code == 413
++
++
++async def test_error_formats():
++    async with client(make_app(rate="1000/minute")) as c:
++        nf = await c.get("/nf")
++        deny = await c.get("/deny")
++        route404 = await c.get("/nope")
++        validation = await c.post("/echo", json={"n": "abc"})
++        boom = await c.get("/boom")
++    assert nf.status_code == 404 and nf.json()["error"] == "NOT_FOUND"
++    assert deny.status_code == 403 and deny.json()["error"] == "CANNOT_SELF_ASSIGN"
++    assert route404.status_code == 404 and route404.json()["error"] == "NOT_FOUND"  # Starlette 404
++    assert validation.status_code == 422 and validation.json()["error"] == "VALIDATION_ERROR"
++    assert isinstance(validation.json()["details"], list)
++    assert boom.status_code == 500 and "secret internals" not in boom.text
++    assert boom.json()["request_id"]
++
++
++def test_parse_limit():
++    assert parse_limit("100/minute") == (100, 60)
++    assert parse_limit("5/second") == (5, 1)
++    with pytest.raises(ValueError):
++        parse_limit("lots")

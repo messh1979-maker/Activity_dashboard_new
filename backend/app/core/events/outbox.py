@@ -26,6 +26,7 @@ app/core/events/outbox.py
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -69,6 +70,7 @@ class OutboxMessage(Base):
         return cls(
             event_id=event.event_id,
             event_type=event.event_type,
-            payload=dict(event.payload),
+            # JSONB needs JSON-safe values (UUID/datetime/Decimal -> str)
+            payload=json.loads(json.dumps(event.payload, default=str)),
             correlation_id=event.correlation_id,
         )

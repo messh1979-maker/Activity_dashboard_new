@@ -25,10 +25,9 @@ from app.core.config import settings
 engine: AsyncEngine = create_async_engine(
     # PostgresDsn validates to a URL object; the engine needs a plain string.
     str(settings.SQLALCHEMY_DATABASE_URI),
-    echo=settings.ENV == "development",
-    future=True,
-    pool_size=20,
-    max_overflow=30,
+    echo=settings.SQL_ECHO,
+    pool_size=settings.DB_POOL_SIZE,
+    max_overflow=settings.DB_MAX_OVERFLOW,
     pool_pre_ping=True,
     pool_recycle=3600,
     connect_args={
@@ -57,6 +56,27 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
     """Get an async database session."""
     async with async_session_factory() as session:
         yield session
+
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """FastAPI dependency: one session per request, one transaction.
+
+    Commits when the handler returns, rolls back on any exception. Business
+    data and the outbox/audit rows written through the same session are
+    therefore atomic (architecture 2.3 / 12.3).
+    """
+    async with async_session_factory() as session:
+        try:
+            yield session
+            await session.commit()
+        except BaseException:
+            await session.rollback()
+            raise
+
+
+async def dispose_engine() -> None:
+    """Close pooled connections (called from the app lifespan on shutdown)."""
+    await engine.dispose()
 
 
 # Unit of Work pattern
@@ -117,6 +137,6 @@ class Transaction:
 
 # Export
 __all__ = [
-    "engine", "async_session_factory", "get_session", 
-    "UnitOfWork", "Transaction"
+    "engine", "async_session_factory", "get_session", "get_db",
+    "dispose_engine", "UnitOfWork", "Transaction",
 ]

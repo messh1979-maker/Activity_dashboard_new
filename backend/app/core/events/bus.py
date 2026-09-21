@@ -49,10 +49,10 @@ app/core/events/bus.py
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from collections import defaultdict
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, DefaultDict
-from collections import defaultdict
 from uuid import UUID, uuid4
 
 logger = logging.getLogger("core.events")
@@ -63,11 +63,7 @@ EventHandler = Callable[["DomainEvent", Any], Awaitable[None]]
 
 @dataclass(frozen=True)
 class DomainEvent:
-    """رویداد دامنه — دقیقاً مطابق سند معماری v2.0، بخش ۲.۳.
-
-    ``event_type`` باید با کاتالوگ رویدادهای سند (بخش ۲.۴) هماهنگ باشد،
-    مثل ``"auth.login.succeeded"``.
-    """
+    """رویداد دامنه — مطابق سند معماری v2.0، بخش ۲.۳."""
 
     event_type: str
     payload: dict[str, Any]
@@ -77,52 +73,74 @@ class DomainEvent:
     correlation_id: UUID | None = None
 
 
+def _as_uuid(value: Any) -> UUID | None:
+    try:
+        return UUID(str(value)) if value else None
+    except (ValueError, AttributeError):
+        return None
+
+
 class EventBus:
-    """Event Bus درون‌پروسه‌ای؛ یک نمونه‌ی Singleton (``event_bus``) در کل اپ استفاده می‌شود."""
+    """Event Bus درون‌پروسه‌ای؛ یک نمونه‌ی Singleton (``event_bus``) در کل اپ.
+
+    دو نوع مشترک:
+
+    * ``transactional=True`` (پیش‌فرض) — داخل ``publish`` و در همان تراکنش اجرا
+      می‌شود (مثل Audit). اگر تراکنش Rollback شود، اثر handler هم برمی‌گردد.
+    * ``transactional=False`` — مصرف‌کننده‌ی «بعد از commit» (مثل Notification):
+      فقط توسط Dispatcher از روی جدول Outbox با تضمین At-Least-Once فراخوانی
+      می‌شود و باید با ``event_id`` Idempotent باشد.
+
+    قبلاً Dispatcher همان handlerهای هم‌تراکنش را دوباره صدا می‌زد و ردیف‌های
+    Audit تکراری ساخته می‌شد؛ حالا این دو دسته کاملاً جدا هستند.
+    """
 
     def __init__(self) -> None:
-        self._handlers: DefaultDict[str, list[EventHandler]] = defaultdict(list)
+        self._sync: DefaultDict[str, list[EventHandler]] = defaultdict(list)
+        self._async: DefaultDict[str, list[EventHandler]] = defaultdict(list)
 
-    def subscribe(self, event_type: str, handler: EventHandler) -> None:
-        """یک ماژول مصرف‌کننده، خودش را برای یک نوع رویداد ثبت می‌کند.
+    def subscribe(self, event_type: str, handler: EventHandler, *,
+                  transactional: bool = True) -> None:
+        target = self._sync if transactional else self._async
+        if handler in target[event_type]:  # idempotent registration (reload / tests)
+            return
+        target[event_type].append(handler)
+        logger.debug("subscribed %s handler for %s", "txn" if transactional else "async", event_type)
 
-        هیچ‌جا از ماژول ناشر import نمی‌شود؛ فقط رشته‌ی ``event_type``
-        (که در کاتالوگ رویدادهای سند مستند شده) لازم است.
-        """
-        self._handlers[event_type].append(handler)
-        logger.debug("subscribed handler for event_type=%s", event_type)
+    def handlers_for(self, event_type: str, *, transactional: bool) -> list[EventHandler]:
+        return list((self._sync if transactional else self._async).get(event_type, ()))
+
+    def clear(self) -> None:
+        """Remove every subscription (test helper)."""
+        self._sync.clear()
+        self._async.clear()
 
     async def publish(self, event: DomainEvent, session: Any) -> None:
-        """رویداد را هم به Outbox درج می‌کند و هم بلافاصله به مشترکین درون‌پروسه تحویل می‌دهد.
+        """Outbox را در همان تراکنش می‌نویسد و handlerهای هم‌تراکنش را اجرا می‌کند.
 
-        ``session`` باید همان AsyncSession تراکنش جاری باشد تا اگر
-        تراکنش اصلی Rollback شود، هیچ اثری (نه ردیف Outbox و نه نوشته‌ی
-        هیچ handler‌ی که در همین session کار کرده) باقی نماند.
+        ``actor_id`` / ``correlation_id`` در صورت خالی بودن از Request Context
+        پر می‌شوند تا کل زنجیره‌ی یک درخواست قابل ردیابی باشد.
         """
-        # وارد کردن دیرهنگام (lazy import) برای پرهیز از وابستگی حلقه‌ای
-        # بین bus.py و outbox.py در زمان import ماژول.
+        from app.core.context import get_context
         from app.core.events.outbox import OutboxMessage
+
+        ctx = get_context()
+        if event.correlation_id is None or event.actor_id is None:
+            event = replace(
+                event,
+                correlation_id=event.correlation_id or _as_uuid(ctx.correlation_id),
+                actor_id=event.actor_id or _as_uuid(ctx.user_id),
+            )
 
         session.add(OutboxMessage.from_event(event))
 
-        handlers = self._handlers.get(event.event_type, [])
-        if not handlers:
-            logger.debug(
-                "no in-process subscriber for event_type=%s (outbox row still written)",
-                event.event_type,
-            )
-            return
-
-        for handler in handlers:
+        for handler in self.handlers_for(event.event_type, transactional=True):
             try:
                 await handler(event, session)
-            except Exception:  # noqa: BLE001 — یک handler خراب نباید انتشار رویداد را متوقف کند
-                logger.exception(
-                    "event handler failed for event_type=%s (event_id=%s)",
-                    event.event_type, event.event_id,
-                )
-                raise  # همان تراکنش است؛ اجازه بده خطا بالا برود و کل تراکنش Rollback شود
+            except Exception:  # noqa: BLE001
+                logger.exception("event handler failed for event_type=%s (event_id=%s)",
+                                 event.event_type, event.event_id)
+                raise  # همان تراکنش است؛ کل تراکنش Rollback شود
 
 
-# نمونه‌ی Singleton — طبق الگوی import سند: `from app.core.events.bus import event_bus`
 event_bus = EventBus()
