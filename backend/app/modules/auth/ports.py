@@ -37,6 +37,12 @@ class MFAVerifyRequest(BaseModel):
     """MFA verification request."""
     mfa_token: str  # TOTP code or SMS code
     mfa_method: str  # totp | email | sms
+    challenge_token: Optional[str] = None  # login-issued challenge (identifies user)
+
+
+class MFACodeRequest(BaseModel):
+    """TOTP code used during enrollment confirmation."""
+    code: str
 
 
 class RegisterRequest(BaseModel):

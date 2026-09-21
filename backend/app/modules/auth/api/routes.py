@@ -7,12 +7,13 @@ Endpoints: /api/v1/auth
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Body, Path, status
+from fastapi import APIRouter, Depends, Query, Body, Path, Request, status
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials
 
 from app.core.dependencies import (
-    get_db_session, get_current_user, get_auth_service, 
-    get_mfa_service, get_rate_limit_check
+    get_db_session, get_current_user, get_auth_service,
+    get_mfa_service, get_rate_limit_check, security_bearer
 )
 from app.core.errors import APIError, AuthenticationError, NotFoundError
 from app.core.database import async_session_context
@@ -89,12 +90,40 @@ async def login(
 
 @router.post("/mfa/verify", response_model=dict)
 async def verify_mfa(
+    request_data: Request,
     request: MFAVerifyRequest,
-    user_id: UUID = Depends(get_current_user),
     db_session=Depends(get_db_session),
-    auth_service: AuthService = Depends(get_auth_service)
+    auth_service: AuthService = Depends(get_auth_service),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_bearer),
 ):
-    """Verify MFA code."""
+    """Verify MFA code.
+
+    During the MFA leg of login the caller does NOT own an access token yet,
+    so the user is identified from the short-lived ``challenge_token`` that
+    login() issued (falling back to the bearer token when provided).
+    """
+    from app.core.config import settings
+    from jose import JWTError, jwt as jose_jwt
+    from app.core.errors import AuthenticationError
+
+    if request.challenge_token:
+        try:
+            claims = jose_jwt.decode(
+                request.challenge_token, settings.SECRET_KEY,
+                algorithms=[settings.ALGORITHM],
+            )
+        except JWTError:
+            raise AuthenticationError(message="مهلت تأیید MFA منقضی شده است؛ دوباره وارد شوید.")
+        if claims.get("purpose") != "mfa":
+            raise AuthenticationError(message="توکن تأیید MFA نامعتبر است.")
+        try:
+            user_id = UUID(claims.get("sub"))
+        except (TypeError, ValueError):
+            raise AuthenticationError(message="توکن تأیید MFA نامعتبر است.")
+    else:
+        # Fallback: an already-authenticated session verifying a code.
+        user_id = await get_current_user(request_data, credentials)
+
     async with db_session() as session:
         try:
             verified = await auth_service.verify_mfa(
@@ -132,15 +161,20 @@ async def enroll_mfa(
     auth_service: AuthService = Depends(get_auth_service)
 ):
     """Enroll TOTP MFA (return QR code info)."""
-    async with db_session() as session:
-        try:
-            result = await auth_service.enroll_mfa(user_id, secret="temp")
-            return {"status": "enrolled", "qr_code": result.get("qr_url"), "secret": result.get("secret")}
-        except APIError as e:
-            return JSONResponse(
-                status_code=e.status_code,
-                content={"error": e.error_code, "message": e.message, "success": False}
-            )
+    try:
+        result = await auth_service.enroll_mfa(user_id, secret="temp")
+        return {
+            "status": "enrolled",
+            "qr_code": result.get("qr_url"),
+            "secret": result.get("secret"),
+            "recovery_codes": result.get("recovery_codes", []),
+            "message": result.get("message"),
+        }
+    except APIError as e:
+        return JSONResponse(
+            status_code=e.status_code,
+            content={"error": e.error_code, "message": e.message, "success": False}
+        )
 
 
 @router.post("/mfa/enroll/confirm", response_model=dict)
@@ -150,15 +184,14 @@ async def enroll_mfa_confirm(
     auth_service: AuthService = Depends(get_auth_service)
 ):
     """Confirm MFA enrollment."""
-    async with db_session() as session:
-        try:
-            result = await auth_service.enroll_mfa(user_id, secret=code)
-            return {"status": "enrollment_confirmed", "message": "MFA ثبت شد"}
-        except APIError as e:
-            return JSONResponse(
-                status_code=e.status_code,
-                content={"error": e.error_code, "message": e.message, "success": False}
-            )
+    try:
+        result = await auth_service.enroll_mfa(user_id, secret=code)
+        return {"status": "enrollment_confirmed", "message": "MFA ثبت شد", "data": result}
+    except APIError as e:
+        return JSONResponse(
+            status_code=e.status_code,
+            content={"error": e.error_code, "message": e.message, "success": False}
+        )
 
 
 @router.post("/devices/register", response_model=dict)

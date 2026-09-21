@@ -54,6 +54,9 @@ class Users(Base):
     token_version = Column(Integer, nullable=False, default=1)
     mfa_enabled = Column(Boolean, nullable=False, default=False)
     mfa_method = Column(String(16), nullable=True)
+    mfa_secret_enc = Column(LargeBinary, nullable=True)
+    mfa_secret_nonce = Column(LargeBinary, nullable=True)
+    mfa_enrolled_at = Column(DateTime(timezone=True), nullable=True)
     is_active = Column(Boolean, nullable=False, default=True)
     failed_login_count = Column(Integer, nullable=False, default=0)
     locked_until = Column(DateTime(timezone=True), nullable=True)
@@ -131,4 +134,23 @@ class Sessions(Base):
 Index("ix_auth_users_hash", Users.national_id_hash)
 
 
-__all__ = ["Users", "UserDevices", "Sessions"]
+class MFARecoveryCodes(Base):
+    """MFA recovery codes (table ``auth.mfa_recovery_codes``)."""
+
+    __tablename__ = "mfa_recovery_codes"
+    __table_args__ = {"schema": "auth", "extend_existing": True}
+
+    id = Column(PGUUID(as_uuid=True), primary_key=True, default=uuid_lib.uuid4)
+    user_id = Column(
+        PGUUID(as_uuid=True),
+        ForeignKey("auth.users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    code_hash = Column(String(64), nullable=False, unique=True)
+    used_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+__all__ = ["Users", "UserDevices", "Sessions", "MFARecoveryCodes"]
