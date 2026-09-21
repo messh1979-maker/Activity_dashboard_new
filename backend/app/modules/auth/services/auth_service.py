@@ -10,6 +10,8 @@ from fastapi import HTTPException, status
 
 from app.core.config import settings
 from app.core.errors import APIError, AuthenticationError, MFARequiredError
+from app.core.events.bus import event_bus
+from app.modules.auth import events as auth_events
 from app.modules.auth.ports import (
     LoginRequest, MFAVerifyRequest, RegisterRequest, TokenResponse,
     DeviceRegisterRequest, DeviceTrustRequest, PasswordChangeRequest,
@@ -43,7 +45,7 @@ class AuthService:
         if not self._validate_national_id(request.national_id):
             raise APIError(
                 error_code="INVALID_NATIONAL_ID",
-                message="فرمت کد ملیnicht صحیح است.",
+                message="فرمت کد ملی صحیح نیست.",
                 status_code=status.HTTP_400_BAD_REQUEST
             )
         
@@ -52,7 +54,7 @@ class AuthService:
         if existing:
             raise APIError(
                 error_code="USER_EXISTS",
-                message="کاربری با این کد ملی już ثبت شده است.",
+                message="کاربری با این کد ملی قبلاً ثبت شده است.",
                 status_code=status.HTTP_409_CONFLICT
             )
         
@@ -61,7 +63,7 @@ class AuthService:
         if existing_username:
             raise APIError(
                 error_code="USERNAME_EXISTS",
-                message="این نام کاربری już استفاده می‌شود.",
+                message="این نام کاربری قبلاً استفاده شده است.",
                 status_code=status.HTTP_409_CONFLICT
             )
         
@@ -92,8 +94,14 @@ class AuthService:
         # Create initial device entry
         await self.device_repo.create_initial_device(user.id)
         
-        # Generate audit log
-        await self._audit_log("user.registered", user.id)
+        # Publish domain event — audit (and anything else that subscribes,
+        # e.g. notification for a welcome email) reacts without auth ever
+        # importing their internal tables (ADR-02 / section 2.3).
+        await self._publish_event(
+            auth_events.AUTH_USER_REGISTERED,
+            actor_id=user.id,
+            payload={"username": user.username},
+        )
         
         return {"status": "success", "user_id": str(user.id)}
     
@@ -109,6 +117,10 @@ class AuthService:
         # Find user by identifier (username or national ID)
         user = await self.user_repo.get_by_identifier(request.identifier)
         if not user:
+            await self._publish_event(
+                auth_events.AUTH_LOGIN_FAILED,
+                payload={"identifier": request.identifier, "reason": "user_not_found"},
+            )
             # Generic error to avoid leaking whether user exists
             raise AuthenticationError(
                 message="اطلاعات ورود نادرست است."
@@ -116,6 +128,11 @@ class AuthService:
         
         # Check if account is active
         if not user.is_active:
+            await self._publish_event(
+                auth_events.AUTH_LOGIN_FAILED,
+                actor_id=user.id,
+                payload={"identifier": request.identifier, "reason": "account_inactive"},
+            )
             raise AuthenticationError(
                 message="حساب کاربری فعال نیست."
             )
@@ -128,6 +145,15 @@ class AuthService:
             if user.failed_login_count >= 5:
                 user.locked_until = datetime.utcnow() + timedelta(minutes=30)
             await self.user_repo.commit()
+            await self._publish_event(
+                auth_events.AUTH_LOGIN_FAILED,
+                actor_id=user.id,
+                payload={
+                    "identifier": request.identifier,
+                    "reason": "wrong_password",
+                    "failed_login_count": user.failed_login_count,
+                },
+            )
             raise AuthenticationError(
                 message="اطلاعات ورود نادرست است."
             )
@@ -152,7 +178,16 @@ class AuthService:
                 "expires_in": 300  # 5 minutes
             }, True
         
-        # No MFA needed - generate tokens
+        # No MFA needed — login is fully successful right here.
+        # NOTE: if MFA *is* required, the success event is published once
+        # verify_mfa() actually confirms the second factor (see below) —
+        # publishing it here too would record a "succeeded" login for an
+        # attempt that hasn't cleared MFA yet.
+        await self._publish_event(
+            auth_events.AUTH_LOGIN_SUCCEEDED,
+            actor_id=user.id,
+            payload={"identifier": request.identifier, "mfa_used": "none"},
+        )
         return await self._generate_tokens(user), False
     
     # --- Token Generation ---
@@ -218,7 +253,24 @@ class AuthService:
     
     async def verify_mfa(self, mfa_token: str, mfa_method: str, user_id: UUID) -> bool:
         """Verify MFA token."""
-        return await self.mfa_service.verify_token(mfa_token, mfa_method, user_id)
+        verified = await self.mfa_service.verify_token(mfa_token, mfa_method, user_id)
+        if verified:
+            # This is the actual "login succeeded" moment for an MFA-gated
+            # login — the plain login() above only got this far because
+            # mfa_required was True, so it deliberately did not publish
+            # AUTH_LOGIN_SUCCEEDED itself.
+            await self._publish_event(
+                auth_events.AUTH_LOGIN_SUCCEEDED,
+                actor_id=user_id,
+                payload={"mfa_used": mfa_method},
+            )
+        else:
+            await self._publish_event(
+                auth_events.AUTH_LOGIN_FAILED,
+                actor_id=user_id,
+                payload={"reason": "mfa_invalid", "mfa_method": mfa_method},
+            )
+        return verified
     
     async def enroll_mfa(self, user_id: UUID, secret: str) -> dict:
         """Enroll TOTP MFA for a user."""
@@ -245,6 +297,16 @@ class AuthService:
         )
         await self.device_repo.add(device)
         await self.user_repo.commit()
+
+        await self._publish_event(
+            auth_events.AUTH_DEVICE_REGISTERED,
+            actor_id=user_id,
+            payload={
+                "device_id": str(device.id),
+                "platform": request.platform,
+                "device_label": request.device_label,
+            },
+        )
         
         return {
             "device_id": str(device.id),
@@ -268,6 +330,12 @@ class AuthService:
         device.trusted_at = datetime.utcnow()
         device.trusted_by_mfa = mfa_satisfied
         await self.user_repo.commit()
+
+        await self._publish_event(
+            auth_events.AUTH_DEVICE_TRUSTED,
+            actor_id=user_id,
+            payload={"device_id": str(device_id), "mfa_satisfied": mfa_satisfied},
+        )
         
         return {"status": "device_trusted"}
     
@@ -302,8 +370,11 @@ class AuthService:
         user.token_version += 1
         await self.user_repo.commit()
         
-        # Audit log
-        await self._audit_log("user.password_changed", user_id)
+        await self._publish_event(
+            auth_events.AUTH_PASSWORD_CHANGED,
+            actor_id=user_id,
+            payload={},
+        )
         
         return {"status": "password_changed"}
     
@@ -355,7 +426,7 @@ class AuthService:
             )
         user.token_version += 1
         await self.user_repo.commit()
-        await self._audit_log("auth.logout", user_id)
+        await self._publish_event(auth_events.AUTH_LOGOUT, actor_id=user_id, payload={})
         return {"status": "logged_out"}
 
     async def list_devices(self, user_id: UUID) -> list:
@@ -556,25 +627,40 @@ class AuthService:
             "last_login_at": user.last_login_at,
         }
     
-    async def _audit_log(self, action: str, user_id: UUID, 
-                         ip_address: str = None, mac_address: str = None):
-        """Log audit event (Append-Only + Hash Chain per ADR-10).
+    async def _publish_event(
+        self, event_type: str, *, payload: dict, actor_id: UUID | None = None
+    ) -> None:
+        """رویداد دامنه را منتشر می‌کند — جایگزین متد قدیمی ``_audit_log``.
 
-        Skipped until the audit module lands (its tables exist, the Python
-        package does not yet).
+        برخلاف نسخه‌ی قبلی، اینجا هیچ importی به ``app.modules.audit``
+        وجود ندارد (نقض مرز ماژول که تست ``test_module_boundaries.py``
+        آن را گرفت). به‌جایش یک ``DomainEvent`` روی ``event_bus`` منتشر
+        می‌شود؛ ماژول Audit (اگر مشترک شده باشد) و هر ماژول دیگری که به
+        این رویداد علاقه دارد (مثلاً Notification برای هشدار «ورود از
+        دستگاه جدید» طبق کاتالوگ رویدادهای سند) بدون هیچ وابستگی کدی
+        به auth، آن را دریافت می‌کنند.
+
+        TODO(security): وقتی ``core/context.py`` (ContextVar) و
+        ``core/middleware/`` واقعی پیاده شدند (بخش ۱.۲ و ۳.۱ سند)،
+        ``ip_address`` / ``mac_address`` / ``device_fingerprint`` باید
+        از آن‌جا در payload اضافه شوند — نه از پارامترهای متد سرویس
+        (که هنوز به این service پاس داده نمی‌شوند).
         """
-        try:
-            from app.modules.audit.db.models import AuditLogs
+        from app.core.events.bus import DomainEvent
 
-            audit = AuditLogs(
-                action=action,
-                user_id=user_id,
-                ip_address=ip_address,
-                mac_address=mac_address,
-                result="success",
-            )
-            # The hash chain is computed by the audit service
-            await self.user_repo.add(audit)
+        event = DomainEvent(event_type=event_type, payload=payload, actor_id=actor_id)
+        try:
+            await event_bus.publish(event, self.user_repo.session)
             await self.user_repo.commit()
-        except ImportError:
-            pass
+        except Exception:
+            # مطابق طراحی bus.py: خطای یک handler بالا می‌آید. این‌جا آن را
+            # قورت نمی‌دهیم (برخلاف باگ قبلی) اما هم اجازه نمی‌دهیم شکست
+            # انتشار رویداد، کل جریان login/register/... را متوقف کند —
+            # چون در نبود Outbox dispatcher واقعی هنوز، این یک تصمیم آگاهانه
+            # است، نه بی‌توجهی. اگر می‌خواهید شکست انتشار رویداد باعث شکست
+            # کل عملیات شود (مثلاً برای الزامات Compliance)، این except را
+            # حذف کنید تا خطا بالا برود.
+            import logging
+            logging.getLogger("auth.events").exception(
+                "failed to publish event_type=%s", event_type
+            )
