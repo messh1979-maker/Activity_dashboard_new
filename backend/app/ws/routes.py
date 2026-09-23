@@ -76,22 +76,16 @@ async def _user_is_active(user_id: UUID) -> bool:
 
 # --- chat gateway -----------------------------------------------------------------
 
-
 @router.websocket(WS_CHAT)
 async def chat_gateway(websocket: WebSocket):
     token = websocket.query_params.get("token", "")
     manager = get_connection_manager()
 
-    await websocket.accept()
-
     if not _is_allowed_origin(websocket.headers):
         await websocket.close(code=4403)
         return
 
-    user_id = await _verify_access_token(token)
-    if user_id is None or not await _user_is_active(user_id):
-        await websocket.close(code=4401, reason="invalid or expired token")
-        return
+    await websocket.accept()
 
     sw = _SlidingWindow(CHAT_RATE_LIMIT, 60)
     joined_room: UUID | None = None
@@ -218,11 +212,11 @@ async def chat_gateway(websocket: WebSocket):
 async def notifications_gateway(websocket: WebSocket):
     token = websocket.query_params.get("token", "")
 
-    await websocket.accept()
-
     if not _is_allowed_origin(websocket.headers):
         await websocket.close(code=4403)
         return
+
+    await websocket.accept()
 
     user_id = await _verify_access_token(token)
     if user_id is None or not await _user_is_active(user_id):
