@@ -1,0 +1,10 @@
+﻿backend/app/core/__init__.py
+backend/app/core/logging.py
+backend/app/core/exceptions.py
+backend/app/core/db/__init__.py
+backend/app/core/middleware/cors.py
+backend/app/core/middleware/body_size_guard.py
+backend/app/core/middleware/authentication.py
+backend/app/core/middleware/device_binding.py
+backend/app/core/middleware/session_validation.py
+backend/app/__init__.py

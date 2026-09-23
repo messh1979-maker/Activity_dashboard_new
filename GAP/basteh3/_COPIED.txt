@@ -1,0 +1,15 @@
+﻿backend/app/modules/groups/__init__.py
+backend/app/modules/groups/db/models.py
+backend/app/modules/goals/__init__.py
+backend/app/modules/goals/db/models.py
+backend/app/modules/calendar/__init__.py
+backend/app/modules/calendar/services/calendar_service.py
+backend/app/modules/sharing/__init__.py
+backend/app/modules/sharing/db/models.py
+backend/app/modules/sharing/services/sharing_service.py
+backend/app/modules/inbox/__init__.py
+backend/app/modules/inbox/db/models.py
+backend/app/modules/inbox/services/inbox_service.py
+backend/app/modules/reporting/__init__.py
+backend/app/modules/ssoldap/__init__.py
+backend/app/modules/ssoldap/services/ldap_service.py

@@ -1,0 +1,8 @@
+﻿backend/pyproject.toml
+backend/Dockerfile
+web/tsconfig.json
+web/Dockerfile
+web/.env.example
+docker-compose.yml
+Makefile
+README.md

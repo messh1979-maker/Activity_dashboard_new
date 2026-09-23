@@ -1,0 +1,16 @@
+﻿backend/app/modules/auth/api/__init__.py
+backend/app/modules/auth/api/router.py
+backend/app/modules/auth/db/repository.py
+backend/app/modules/auth/services/mfa_service.py
+backend/app/modules/auth/services/device_service.py
+backend/app/modules/auth/schemas.py
+backend/app/modules/rbac/api/router.py
+backend/app/modules/rbac/db/repository.py
+backend/app/modules/rbac/services/__init__.py
+backend/app/modules/rbac/services/policy_engine.py
+backend/app/modules/rbac/cache.py
+backend/app/modules/rbac/schemas.py
+backend/app/modules/audit/api/router.py
+backend/app/modules/audit/services/__init__.py
+backend/app/modules/audit/services/hash_chain.py
+backend/app/modules/audit/schemas.py

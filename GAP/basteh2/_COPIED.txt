@@ -1,0 +1,17 @@
+﻿backend/app/modules/auth/__init__.py
+backend/app/modules/auth/api/deps.py
+backend/app/modules/auth/db/__init__.py
+backend/app/modules/auth/db/models.py
+backend/app/modules/auth/services/__init__.py
+backend/app/modules/auth/services/auth_service.py
+backend/app/modules/auth/events.py
+backend/app/modules/auth/ports.py
+backend/app/modules/rbac/__init__.py
+backend/app/modules/rbac/db/models.py
+backend/app/modules/rbac/services/permission_service.py
+backend/app/modules/rbac/events.py
+backend/app/modules/rbac/ports.py
+backend/app/modules/audit/__init__.py
+backend/app/modules/audit/db/models.py
+backend/app/modules/audit/services/audit_service.py
+backend/app/modules/audit/events.py

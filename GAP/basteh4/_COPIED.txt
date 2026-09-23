@@ -1,0 +1,10 @@
+﻿backend/app/ws/__init__.py
+backend/app/modules/chat/__init__.py
+backend/app/modules/chat/db/models.py
+backend/app/modules/chat/services/chat_service.py
+backend/app/modules/notification/__init__.py
+backend/app/modules/notification/services/notification_service.py
+backend/app/modules/notification/events.py
+backend/app/modules/files/__init__.py
+backend/app/modules/files/db/models.py
+backend/app/modules/files/services/file_service.py

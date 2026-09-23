@@ -1,0 +1,5 @@
+﻿backend/tests/test_auth.py
+backend/tests/test_rbac.py
+backend/tests/test_ws.py
+web/src/__tests__/auth.test.ts
+web/playwright.config.ts

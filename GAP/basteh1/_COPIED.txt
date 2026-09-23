@@ -1,0 +1,14 @@
+﻿backend/app/core/config.py
+backend/app/core/security.py
+backend/app/core/db/base.py
+backend/app/core/db/session.py
+backend/app/core/events/__init__.py
+backend/app/core/events/bus.py
+backend/app/core/events/outbox.py
+backend/app/core/middleware/__init__.py
+backend/app/core/middleware/request_id.py
+backend/app/core/middleware/security_headers.py
+backend/app/core/middleware/ip_filter.py
+backend/app/core/middleware/rate_limit.py
+backend/app/core/middleware/audit_context.py
+backend/app/main.py

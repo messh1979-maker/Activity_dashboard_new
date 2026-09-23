@@ -1,0 +1,5 @@
+﻿web/src/main.tsx
+web/src/App.tsx
+web/src/api/client.ts
+web/src/security/fingerprint.ts
+desktop/main.py

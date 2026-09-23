@@ -1,0 +1,8 @@
+﻿backend/alembic.ini
+backend/alembic/env.py
+backend/requirements.txt
+backend/.env.example
+web/package.json
+web/vite.config.ts
+RUN_PROJECT_GUIDE.md
+architecture-v2.md
