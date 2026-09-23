@@ -67,6 +67,11 @@ class AdminUserService:
         # همان RoleAssignmentService که در rbac_patch.zip ساختیم را تزریق کنید.
         self.role_assignment_service = role_assignment_service
 
+    @staticmethod
+    def _actor_id(actor: Any) -> Any:
+        """accept str (from get_current_user) or an object with .id"""
+        return actor.id if not isinstance(actor, str) else actor
+
     # ── ایجاد ──────────────────────────────────────────────
     async def create_user(self, actor: Any, request: AdminCreateUserRequest) -> dict:
         if not _validate_national_id(request.national_id):
@@ -112,7 +117,7 @@ class AdminUserService:
 
         await self._publish(
             AUTH_USER_CREATED_BY_ADMIN,
-            actor_id=actor.id,
+            actor_id=self._actor_id(actor),
             payload={
                 "target_user_id": str(user.id),
                 "username": user.username,
@@ -183,7 +188,7 @@ class AdminUserService:
             new_value["display_name"] = request.display_name
 
         if request.is_active is not None and request.is_active != user.is_active:
-            if user_id == actor.id and request.is_active is False:
+            if user_id == self._actor_id(actor) and request.is_active is False:
                 raise APIError(
                     error_code="CANNOT_DEACTIVATE_SELF",
                     message="نمی‌توانید حساب خودتان را غیرفعال کنید.",
@@ -206,7 +211,7 @@ class AdminUserService:
             event_type = AUTH_USER_DEACTIVATED if new_value.get("is_active") is False else AUTH_USER_UPDATED
             await self._publish(
                 event_type,
-                actor_id=actor.id,
+                actor_id=self._actor_id(actor),
                 payload={
                     "target_user_id": str(user_id),
                     "old_value": old_value,
@@ -233,7 +238,7 @@ class AdminUserService:
             if target is None:
                 failed.append(BulkFailure(user_id=uid, code="NOT_FOUND"))
                 continue
-            if target.id == actor.id:
+            if target.id == self._actor_id(actor):
                 failed.append(BulkFailure(user_id=uid, code="CANNOT_MODIFY_SELF"))
                 continue
             # کاربر SSO بدون رمز محلی نباید بدون تنظیم رمز به حالت local برود
@@ -249,7 +254,7 @@ class AdminUserService:
 
             await self._publish(
                 AUTH_USER_LOGIN_MODE_CHANGED,
-                actor_id=actor.id,
+                actor_id=self._actor_id(actor),
                 payload={
                     "target_user_id": str(uid),
                     "old_value": old,

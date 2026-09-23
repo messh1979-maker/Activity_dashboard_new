@@ -1,180 +1,151 @@
-"""
-Chat WebSocket Complete Flow Implementation
-Architecture Reference: Sections 8.1, 8.2, 8.3
+"""Connection manager for chat/notification WebSockets (architecture 8.1).
+
+Connections are kept in-process per worker; room messages are fanned out
+through Redis pub/sub so multiple workers deliver to the same room.
+Redis is optional: when unreachable the in-memory broker on this process
+is used, which is exactly right for local development and testing.
 """
 
-import json
+from __future__ import annotations
+
 import asyncio
-from typing import Dict, Set, Optional, Any
+import itertools
+import json
+import logging
+from typing import Any, Awaitable, Callable, Optional
 from uuid import UUID
-from datetime import datetime, timedelta
-from fastapi import WebSocket, WebSocketDisconnect
-from starlette.websockets import State
 
-from app.core.database import async_session_context
-from app.modules.chat.services.chat_service import ChatService
-from app.modules.chat.db.Models import Rooms, RoomMembers, Messages
-from app.core.errors import APIError, NotFoundError, PrivacyHiddenError
+from fastapi import WebSocket
+
+from app.core.redis import get_redis_broker
+
+logger = logging.getLogger("ws.manager")
+
+_counter = itertools.count(1)
+
+MSG_BUFFER_LIMIT = 512
 
 
-class ChatWebSocketManager:
-    """Manages WebSocket connections and message broadcasting."""
-    
-    def __init__(self, chat_service: ChatService):
-        self.chat_service = chat_service
-        # Connection tracking: room_id -> set of (websocket, user_id)
-        self.room_connections: Dict[str, Set[tuple]] = {}
-        # User tracking: user_id -> set of room_ids
-        self.user_rooms: Dict[str, Set[str]] = {}
-        # Message handlers by type
-        self.message_handlers: Dict[str, Any] = {}
-    
-    async def connect(self, websocket: WebSocket, user_id: UUID, room_id: UUID) -> bool:
-        """Connect a user to a chat room.
-        
-        Returns True if connection successful, False if should reject.
+class _RoomConnection:
+    """One accepted socket in a room."""
+
+    def __init__(self, ws: WebSocket, user_id: UUID, socket_id: int) -> None:
+        self.ws = ws
+        self.user_id = user_id
+        self.socket_id = socket_id
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=MSG_BUFFER_LIMIT)
+
+
+class ConnectionManager:
+    """In-process socket registry + Redis pub/sub bridge per room.
+
+    ``join`` adds the socket to ``_rooms`` and registers a per-socket
+    writer task that drains messages broadcast on the room channel.
+    ``publish_room`` writes to Redis ``room:{room_id}`` which every worker
+    subscribed for that room relays to its local sockets.
+    """
+
+    def __init__(self) -> None:
+        self._rooms: dict[str, dict[str, _RoomConnection]] = {}
+        self._lock = asyncio.Lock()
+        self._sub_tasks: dict[str, asyncio.Task] = {}
+        self._broker = get_redis_broker()
+
+    @staticmethod
+    def _channel(room_id: UUID) -> str:
+        return f"room:{room_id}"
+
+    async def join(self, room_id: UUID, ws: WebSocket, user_id: UUID) -> None:
+        """Register an accepted socket on a room and relay room broadcasts."""
+        key = self._channel(room_id)
+        socket_id = next(_counter)
+        conn = _RoomConnection(ws, user_id, socket_id)
+        async with self._lock:
+            self._rooms.setdefault(key, {})[str(socket_id)] = conn
+            if key not in self._sub_tasks:
+                task = asyncio.create_task(self._relay_loop(key))
+                self._sub_tasks[key] = task
+
+    async def leave(self, room_id: UUID, ws: WebSocket) -> None:
+        key = self._channel(room_id)
+        async with self._lock:
+            bucket = self._rooms.get(key)
+            if bucket is None:
+                return
+            for socket_id in list(bucket):
+                if bucket[socket_id].ws is ws:
+                    bucket.pop(socket_id, None)
+            if not bucket:
+                self._rooms.pop(key, None)
+                task = self._sub_tasks.pop(key, None)
+                if task is not None:
+                    task.cancel()
+
+    async def broadcast(self, room_id: UUID, payload: dict) -> None:
+        """Publish a message to a room channel for every worker to relay.
+
+        Each worker's ``_relay_loop`` subscription delivers the payload to
+        the local sockets connected to that room (single delivery only).
         """
-        # Accept connection
-        await websocket.accept()
-        
-        # Join room (validates membership)
-        joined = await self.join_room(room_id, user_id, websocket)
-        if not joined:
-            await websocket.close(code=4403)  # Not a member
-            return False
-        
-        # Track connection
-        if room_id not in self.room_connections:
-            self.room_connections[room_id] = set()
-        self.room_connections[room_id].add((websocket, user_id))
-        
-        if user_id not in self.user_rooms:
-            self.user_rooms[user_id] = set()
-        self.user_rooms[user_id].add(room_id)
-        
-        # Notify room
-        await self.broadcast_system(room_id, {
-            "type": "system",
-            "action": "user_joined",
-            "user_id": str(user_id),
-            "timestamp": datetime.utcnow().isoformat()
-        })
-        
-        return True
-    
-    async def disconnect(self, websocket: WebSocket, user_id: UUID) -> None:
-        """Handle user disconnection."""
-        # Leave all rooms
-        rooms = self.user_rooms.get(user_id, set())
-        for room_id in rooms:
-            await self.leave_room(room_id, user_id, websocket)
-        
-        # Remove tracking
-        if user_id in self.user_rooms:
-            del self.user_rooms[user_id]
-        
-        # Cleanup empty room connections
-        for room_id, connections in self.room_connections.items():
-            self.room_connections[room_id] = {
-                c for c in connections if c[1] != user_id
-            }
-            if not self.room_connections[room_id]:
-                del self.room_connections[room_id]
-    
-    async def join_room(self, room_id: UUID, user_id: UUID, websocket: WebSocket) -> bool:
-        """Validate and join a room."""
-        # Check if room exists and user is member
-        is_member = await self.chat_service.is_active_member(room_id, user_id)
-        if not is_member:
-            return False
-        
-        # Add to room tracking
-        if room_id not in self.room_connections:
-            self.room_connections[room_id] = set()
-        self.room_connections[room_id].add((websocket, user_id))
-        
-        if user_id not in self.user_rooms:
-            self.user_rooms[user_id] = set()
-        self.user_rooms[user_id].add(room_id)
-        
-        return True
-    
-    async def leave_room(self, room_id: UUID, user_id: UUID) -> None:
-        """Handle user leaving a room."""
-        # Remove from tracking
-        if room_id in self.room_connections:
-            self.room_connections[room_id] = {
-                c for c in self.room_connections[room_id] if c[1] != user_id
-            }
-            if not self.room_connections[room_id]:
-                del self.room_connections[room_id]
-        
-        if user_id in self.user_rooms:
-            self.user_rooms[user_id].discard(room_id)
-            if not self.user_rooms[user_id]:
-                del self.user_rooms[user_id]
-    
-    async def send_message(self, room_id: UUID, sender_id: UUID, message: str, 
-                          reply_to: Optional[UUID] = None) -> Optional[Messages]:
-        """Send a message to a room."""
-        # Validate membership (re-check)
-        is_member = await self.chat_service.is_active_member(room_id, sender_id)
-        if not is_member:
-            return None
-        
-        # Persist message
-        message_obj = await self.chat_service.persist(
-            room_id=room_id,
-            sender_id=sender_id,
-            body=message,
-            reply_to_id=reply_to
-        )
-        
-        # Broadcast to all connected clients in room
-        if room_id in self.room_connections:
-            broadcast_data = message_obj.to_event()
-            for ws, uid in self.room_connections[room_id]:
-                try:
-                    await ws.send_text(json.dumps(broadcast_data))
-                except Exception:
-                    # Connection lost, will cleanup on disconnect
-                    pass
-        
-        # Audit log
-        await self.chat_service.audit_log(
-            action="chat.message.sent",
-            entity_type="chat_message",
-            entity_id=message_obj.id,
-            user_id=sender_id,
-            result="success"
-        )
-        
-        return message_obj
-    
-    async def broadcast_system(self, room_id: UUID, message: dict) -> None:
-        """Broadcast a system message to all in room."""
-        if room_id in self.room_connections:
-            for ws, uid in self.room_connections[room_id]:
-                try:
-                    await ws.send_text(json.dumps(message))
-                except Exception:
-                    pass
-    
-    def register_handler(self, message_type: str, handler: Any) -> None:
-        """Register a handler for a message type."""
-        self.message_handlers[message_type] = handler
+        raw = json.dumps(payload, ensure_ascii=False, default=str)
+        await self.publish_room(room_id, raw)
+
+    async def publish_room(self, room_id: UUID, raw: str) -> None:
+        """Redis pub/sub for cross-worker delivery into ``room:{room_id}``."""
+        await self._broker.publish(self._channel(room_id), raw)
+
+    async def _relay_loop(self, key: str) -> None:
+        """Subscribe to a room channel and relay messages to local sockets."""
+        room_id = key.split(":", 1)[1]
+        try:
+            async for message in self._broker.subscribe(key):
+                async with self._lock:
+                    bucket = list(self._rooms.get(key, {}).values())
+                for conn in bucket:
+                    try:
+                        conn.queue.put_nowait(message)
+                    except asyncio.QueueFull:
+                        pass
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # publisher gone between publish and subscribe
+            logger.warning("relay loop for %s stopped: %s", key, exc)
+
+    async def drain_to(self, room_id: UUID, ws: WebSocket) -> None:
+        """Writer task: drain this socket's queue into the wire connection."""
+        # Shared writer owned by the endpoint; see routes/chat.py
+        key = self._channel(room_id)
+        socket_id = None
+        async with self._lock:
+            bucket = self._rooms.get(key, {})
+            for sid, c in bucket.items():
+                if c.ws is ws:
+                    socket_id = sid
+                    break
+        if socket_id is None:
+            return
+        conn = bucket[socket_id]
+        while True:
+            raw = await conn.queue.get()
+            try:
+                await ws.send_text(raw)
+            except Exception:
+                return
 
 
-# Global manager instance (initialized during app startup)
-chat_ws_manager: Optional[ChatWebSocketManager] = None
+# --- process-wide singleton (initialized in app lifespan) ---
+
+_manager: Optional[ConnectionManager] = None
 
 
-def init_chat_websocket_manager(chat_service: Any) -> None:
-    """Initialize the WebSocket manager."""
-    global chat_ws_manager
-    chat_ws_manager = ChatWebSocketManager(chat_service)
+def get_connection_manager() -> ConnectionManager:
+    global _manager
+    if _manager is None:
+        _manager = ConnectionManager()
+    return _manager
 
 
-# Dependency to get manager
-def get_ws_manager() -> ChatWebSocketManager:
-    return chat_ws_manager
+def reset_connection_manager() -> None:
+    """Testing helper."""
+    global _manager
+    _manager = None

@@ -1,9 +1,10 @@
-"""Notification module public interface (stub — full implementation per Architecture v2.0 Section M10)."""
+"""Notification module public interface (real DDL).
+
+Subscribes to auth login / role-change events and writes a
+notification row for the affected user (inbox channel).
+"""
+
 from app.modules.notification.api.routes import router
-
-
-def register_event_handlers(event_bus) -> None:
-    """Subscribe to cross-module events (no-op stub)."""
-
+from app.modules.notification.events import register_event_handlers
 
 __all__ = ["router", "register_event_handlers"]

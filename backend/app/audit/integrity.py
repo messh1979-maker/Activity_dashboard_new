@@ -1,79 +1,109 @@
 """
-Audit Hash Chain Integrity Verification
-Architecture Reference: Section 11.6, ADR-10
+Audit Hash Chain Integrity Verification (real DDL, section 11.6 / ADR-10).
+
+Re-links the ``audit.audit_logs`` chain from the database and verifies every
+link: prev_hash[i] MUST equal row_hash[i-1], and the self hash is recomputed
+with the same formula as ``AuditService._chain_hash_audit``.
 """
+
+from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
-from sqlalchemy import select, func
-from sqlalchemy.orm import Session
 
-try:
-    from app.modules.audit.db.Models import audit_logs
-except ImportError:  # stub modules have no DB models yet
-    audit_logs = None  # type: ignore[assignment]
+from sqlalchemy import text
 
 
-def compute_row_hash(prev_hash: str, user_id, action: str, timestamp, ip_address, 
-                    mac_address: str, result: str, details: dict) -> str:
-    """Compute the row_hash for audit integrity."""
-    material = f"|{prev_hash}|{user_id}|{action}|{timestamp.isoformat()}|" \
-               f"{ip_address}|{mac_address}|{result}|{json.dumps(details, sort_keys=True, ensure_ascii=False)}"
+def _recompute_row_hash(prev_hash_ord, user_id, action, timestamp, ip_address,
+                        mac_address, result, details) -> str:
+    details_str = json.dumps(details, sort_keys=True, ensure_ascii=False) if details else "null"
+    material = "|".join([
+        prev_hash_ord or "GENESIS",
+        str(user_id) if user_id else "None",
+        action or "",
+        timestamp.isoformat() if timestamp else "",
+        str(ip_address) if ip_address else "",
+        mac_address or "",
+        result or "",
+        details_str,
+    ])
     return hashlib.sha256(material.encode()).hexdigest()
 
 
-async def verify_integrity(session: Session) -> dict:
-    """Verify the audit log hash chain integrity.
+def _recompute_login_hash(prev_hash_ord, user_id, username, timestamp, ip_address,
+                          mac_address, success, failure_reason) -> str:
+    material = "|".join([
+        prev_hash_ord or "GENESIS",
+        str(user_id) if user_id else "None",
+        username or "",
+        timestamp.isoformat() if timestamp else "",
+        str(ip_address) if ip_address else "",
+        mac_address or "",
+        "success" if success else "failure",
+        failure_reason or "",
+    ])
+    return hashlib.sha256(material.encode()).hexdigest()
 
-    Returns:
-        dict with verification results
-    """
-    if audit_logs is None:
-        return {"status": "unavailable", "message": "Audit models not implemented", "broken_links": 0}
-    # Get all audit logs ordered by id
-    result = await session.execute(
-        select(audit_logs).order_by(audit_logs.id)
-    )
-    logs = result.scalars().all()
-    
-    if not logs:
-        return {"status": "empty", "message": "No audit logs to verify", "broken_links": 0}
-    
-    broken_links = 0
-    total_links = len(logs) - 1  # Number of chain links
-    
-    for i in range(1, len(logs)):
-        current_log = logs[i]
-        prev_log = logs[i - 1]
-        
-        # Verify current.log.prev_hash == prev_log.row_hash
-        expected_prev = prev_log.row_hash
-        actual_prev = current_log.prev_hash
-        
-        if expected_prev != actual_prev:
-            broken_links += 1
-    
-    # Also verify the hash computation is correct for each log
-    # (Optional: could recompute and compare)
-    
-    status = "integrity_ok" if broken_links == 0 else "integrity_broken"
-    
+
+async def _verify_log_chain(conn, table: str) -> tuple[int, int]:
+    """Verify one hash chain (audit_logs or login_audit_logs); returns (total, broken)."""
+    broken = 0
+    prev_row_hash: str | None = None
+    total = 0
+    if table == "audit.login_audit_logs":
+        projection = ("id, user_id, timestamp, ip_address, mac_address,"
+                      " prev_hash, row_hash, username, success, failure_reason")
+    else:
+        projection = ("id, user_id, timestamp, ip_address, mac_address,"
+                      " prev_hash, row_hash, action, result, details")
+    rows = (await conn.execute(text(f"""
+        SELECT {projection}
+          FROM {table}
+         ORDER BY id
+    """))).mappings().all()
+    for row in rows:
+        total += 1
+        if row["prev_hash"] != prev_row_hash:
+            broken += 1
+        if table == "audit.login_audit_logs":
+            recomputed = _recompute_login_hash(
+                prev_row_hash, row["user_id"], row["username"], row["timestamp"],
+                row["ip_address"], row["mac_address"], row["success"], row["failure_reason"],
+            )
+        else:
+            recomputed = _recompute_row_hash(
+                prev_row_hash, row["user_id"], row["action"], row["timestamp"],
+                row["ip_address"], row["mac_address"], row["result"], row["details"],
+            )
+        if recomputed != row["row_hash"]:
+            broken += 1
+        prev_row_hash = row["row_hash"]
+    return total, broken
+
+
+async def verify_integrity(conn) -> dict:
+    """Verify every hash chain (audit_logs + login_audit_logs)."""
+    total = 0
+    broken = 0
+    for table in ("audit.audit_logs", "audit.login_audit_logs"):
+        t, b = await _verify_log_chain(conn, table)
+        total += t
+        broken += b
+
+    status = "integrity_ok" if broken == 0 else "integrity_broken"
     return {
         "status": status,
-        "total_logs": len(logs),
-        "broken_links": broken_links,
-        "total_links": total_links,
-        "message": "Chain integrity verified" if broken_links == 0 else f"{broken_links} chain links broken"
+        "total_logs": total,
+        "broken_links": broken,
+        "total_links": max(total - 2, 0),
+        "message": "Chain integrity verified" if broken == 0 else f"{broken} chain links broken",
     }
 
 
 async def check_audit_integrity() -> dict:
-    """Public function to check audit integrity (run as scheduled job)."""
+    """Public entry point for GET /audit/integrity-check."""
     from app.core.database import engine
-    
-    async with engine.begin() as conn:
-        result = await verify_integrity(
-            type('obj', session=True, execute=lambda x: conn.execute(x)).()
-        )
+
+    async with engine.connect() as conn:
+        result = await verify_integrity(conn)
     return result

@@ -60,6 +60,10 @@ export default function GroupsPage() {
   const [memberUid, setMemberUid] = useState('')
   const [adding, setAdding] = useState(false)
 
+  // Users for dropdown (loaded once on mount)
+  const [allUsers, setAllUsers] = useState<{ id: string; username: string; display_name: string; is_active: boolean }[]>([])
+  const [usersLoading, setUsersLoading] = useState(false)
+
   const loadGroups = useCallback(async () => {
     setError(null)
     try {
@@ -96,6 +100,33 @@ export default function GroupsPage() {
     }
   }, [selectedId, loadMembers])
 
+  const loadUsers = useCallback(async () => {
+    setUsersLoading(true)
+    try {
+      const res = await api.get('/admin/users')
+      const d = res.data as { items?: { id: string; username: string; display_name: string; is_active: boolean }[] }
+      const items = d?.items ?? []
+      const sorted = [...items].sort((a, b) =>
+        (a.display_name || a.username).localeCompare(b.display_name || b.username, 'fa')
+      )
+      setAllUsers(sorted)
+    } catch {
+      setAllUsers([])
+    } finally {
+      setUsersLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadUsers()
+  }, [loadUsers])
+
+  const nonMembers = allUsers.filter((u) => !members.some((m) => m.user_id === u.id))
+  const userNameOf = (uid: string): string => {
+    const u = allUsers.find((x) => x.id === uid)
+    return u ? u.display_name || u.username : uid
+  }
+
   const onCreate = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!name.trim()) return
@@ -110,8 +141,9 @@ export default function GroupsPage() {
       setName('')
       setDescription('')
       await loadGroups()
-    } catch {
-      setError('ایجاد گروه ناموفق بود.')
+    } catch (e) {
+      const d = (e as { response?: { data?: { message?: string; error?: string } } })?.response?.data
+      setError(d?.message ?? d?.error ?? 'ایجاد گروه ناموفق بود.')
     } finally {
       setCreating(false)
     }
@@ -119,18 +151,19 @@ export default function GroupsPage() {
 
   const onAddMember = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!selectedId) return
+    if (!selectedId || !memberUid) return
     setAdding(true)
     setError(null)
     try {
       await api.post(`/groups/${selectedId}/members`, {
-        user_id: memberUid.trim() || user?.id,
+        user_id: memberUid,
         is_manager: false,
       })
       setMemberUid('')
       await loadMembers(selectedId)
-    } catch {
-      setError('افزودن عضو ناموفق بود. تنها مدیر گروه می‌تواند عضو اضافه کند.')
+    } catch (e) {
+      const d = (e as { response?: { data?: { message?: string; error?: string } } })?.response?.data
+      setError(d?.message ?? d?.error ?? 'افزودن عضو ناموفق بود. تنها مدیر گروه می‌تواند عضو اضافه کند.')
     } finally {
       setAdding(false)
     }
@@ -212,7 +245,10 @@ export default function GroupsPage() {
                                 key={m.user_id}
                                 className="flex items-center justify-between gap-2 rounded-xl bg-slate-50 px-3 py-2 text-xs"
                               >
-                                <span className="min-w-0 truncate" dir="ltr">{m.user_id}</span>
+                                <span className="min-w-0 truncate">
+                                  <span className="font-medium text-slate-700">{userNameOf(m.user_id)}</span>
+                                  <span className="mr-2 text-slate-400" dir="ltr">{m.user_id.slice(0, 8)}…</span>
+                                </span>
                                 <div className="flex shrink-0 items-center gap-2">
                                   {m.is_manager && (
                                     <span className="badge bg-violet-100 text-violet-700">مدیر</span>
@@ -226,15 +262,32 @@ export default function GroupsPage() {
                           </ul>
                         )}
                         {isOwner && (
-                          <form onSubmit={onAddMember} className="mt-3 flex gap-2">
-                            <input
-                              className="input text-xs"
-                              dir="ltr"
-                              placeholder="شناسه کاربر (خالی = خودم)"
-                              value={memberUid}
-                              onChange={(e) => setMemberUid(e.target.value)}
-                            />
-                            <button type="submit" disabled={adding} className="btn-ghost shrink-0 bg-brand-50 text-brand-700 hover:bg-brand-100">
+                          <form onSubmit={onAddMember} className="mt-3 flex flex-col sm:flex-row gap-2">
+                            <div className="flex-1 flex flex-col gap-1">
+                              <label className="text-[11px] text-slate-500">افزودن کاربر به گروه</label>
+                              <select
+                                className="input text-xs"
+                                value={memberUid}
+                                onChange={(e) => setMemberUid(e.target.value)}
+                                disabled={adding || nonMembers.length === 0}
+                              >
+                                <option value="">— انتخاب از کاربران سیستم —</option>
+                                {nonMembers.map((u) => (
+                                  <option key={u.id} value={u.id}>
+                                    {u.display_name || u.username}{u.is_active ? '' : ' (غیرفعال)'}
+                                  </option>
+                                ))}
+                              </select>
+                              {nonMembers.length === 0 && !usersLoading && (
+                                <p className="text-[10px] text-slate-400">همه‌ی کاربران سیستم عضو این گروه هستند.</p>
+                              )}
+                              {usersLoading && <p className="text-[10px] text-slate-400">در حال بارگذاری کاربران…</p>}
+                            </div>
+                            <button
+                              type="submit"
+                              disabled={adding || !memberUid}
+                              className="btn-ghost shrink-0 bg-brand-50 text-brand-700 hover:bg-brand-100 self-end"
+                            >
                               <Icon d={P.plus} className="h-4 w-4" />
                               {adding ? '...' : 'افزودن'}
                             </button>

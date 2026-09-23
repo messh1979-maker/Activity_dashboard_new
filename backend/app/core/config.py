@@ -104,11 +104,27 @@ class Settings(BaseSettings):
 
     # ── File storage
     MAX_UPLOAD_SIZE: int = 52_428_800  # 50MB
+    FILE_STORAGE_DIR: str = "backend/storage/uploads"
     ALLOWED_IMAGE_TYPES: List[str] = ["image/jpeg", "image/png", "image/gif"]
     ALLOWED_DOCUMENT_TYPES: List[str] = [
         "application/pdf", "application/msword",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ]
+
+    # ── SSO / LDAP (M12) — LdapService expects these attributes
+    LDAP_SERVER_URI: str = "ldaps://ad.corp.local:636"
+    LDAP_BASE_DN: str = "DC=corp,DC=local"
+    LDAP_BIND_DN: str = ""
+    LDAP_BIND_PASSWORD: str = ""
+    LDAP_USER_SEARCH_FILTER: str = "(sAMAccountName={username})"
+    LDAP_ATTR_OBJECT_GUID: str = "objectGUID"
+    LDAP_ATTR_NATIONAL_ID: str | None = None
+    LDAP_ATTR_DISPLAY_NAME: str = "displayName"
+    LDAP_ATTR_MEMBEROF: str = "memberOf"
+    LDAP_GROUP_ROLE_MAP: dict = {}
+    LDAP_AUTO_PROVISION: bool = True
+    LDAP_KERBEROS_ENABLED: bool = False  # set true only with a real Keytab
+    LDAP_KERBEROS_KEYTAB: str = ""       # path to the HTTP service keytab
 
     # ── Logging
     LOG_LEVEL: str = "INFO"

@@ -1,6 +1,6 @@
 # راهنمای راه‌اندازی پروژه (بدون داکر)
 
-> به‌روزرسانی: ۱۹ سپتامبر ۲۰۲۶ — تمام مراحل زیر روی همین ماشین اجرا و تأیید شده است.
+> به‌روزرسانی: ۲۲ سپتامبر ۲۰۲۶ — تمام مراحل زیر روی همین ماشین اجرا و تأیید شده است.
 > Backend و Frontend هر دو بدون داکر، با PostgreSQL نصب‌شده روی ویندوز کار می‌کنند.
 
 ---
@@ -12,7 +12,7 @@
 | Python | 3.12.8 | بک‌اند با همین نسخه اجرا شد |
 | Node.js / npm | v24 / v11 (نسخه ۱۸+ کافی است) | فرانت‌اند |
 | PostgreSQL | 16 (سرویس `postgresql-x64-16`) | به‌صورت native روی ویندوز، بدون داکر |
-| Redis | — | **اختیاری/نصب نیست**؛ کد فعلی به آن نیاز ندارد (توضیح در بخش ۶) |
+| Redis | — | **اختیاری/نصب نیست**؛ `RedisBroker` با fallback درون‌فرایندی کار می‌کند (توضیح در بخش ۶ و ۸و) |
 | اینترنت | لازم برای `pip install` و `npm install` اول | — |
 
 مسیر پروژه: `C:\Projects\Run_Projects_in_Git\Activity_dashboard`
@@ -81,16 +81,29 @@ python -m venv .venv
 #      CORS_ORIGINS=["http://localhost:3000","http://127.0.0.1:3000","http://localhost:5173","http://127.0.0.1:5173","http://localhost:8080"]
 #    - SECRET_KEY حداقل ۳۲ کاراکتر
 
-# ۴) اجرای مایگریشن (ساخت ۱۳ اسکیما: auth, rbac, groups, planning, calendar, chat, files, inbox, notification, reporting, sharing, ssoldap, audit)
+# ۴) اجرای مایگریشن (ساخت ۱۳ اسکیما + اسکیمای هسته `core`)
+#    head فعلی: 0002_core_outbox (جدول transactional-outbox در بخش ۲.۳ سند)
 .\.venv\Scripts\python.exe -m alembic upgrade head
-.\.venv\Scripts\python.exe -m alembic current   # باید 0001_initial (head) را نشان دهد
+.\.venv\Scripts\python.exe -m alembic current   # باید 0002_core_outbox (head) را نشان دهد
 
-# ۵) اجرای سرور
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+# ۵) اجرای سرور (روش مطمئن در PowerShell — پشت‌زمینه و جدا از shell)
+#    نکته: Start-Job فرانت از shell tool می‌میرد؛ cmd start /b فرزند را جدا می‌کند و زنده می‌ماند.
+cmd /c "start /b .venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > %TEMP%\opencode\srv8000.log 2>&1"
+
+# اجرای پیش‌رو (جلوی) برای دیباگ:
+#     .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-تست سلامت: http://127.0.0.1:8000/health باید `{"status":"healthy", ...}` با ۱۲ ماژول برگرداند.
+تست سلامت: http://127.0.0.1:8000/health باید `{"status":"healthy", ...}` با ۱۳ ماژول برگرداند.
 مستندات API: http://127.0.0.1:8000/docs
+پس از راه‌اندازی، بررسی کامل با اسکریپت‌های تست:
+```powershell
+$env:PYTHONIOENCODING='utf-8'
+.\.venv\Scripts\python.exe "%TEMP%\opencode\smoke.py"    # 17 endpoint خواندنی → 16 OK + 1 SSO challenge (401)
+```
+> `401` روی `GET /api/v1/auth/sso/negotiate` **رفتار درست** است (چالش SPNEGO + هدر `WWW-Authenticate: Negotiate`)، نه خطا.
+>
+> ⚠️ بهداشت تست (مهم): هر `POST /auth/login` موفق `token_version` کاربر را زیاد می‌کند و **توکن‌های قبلی را باطل می‌کند**؛ پس لاگین‌های پشت‌سرهم/موازی همدیگر را می‌اندازند (`401 Token revoked`). همچنین محدودیت `RATE_LIMIT_AUTH=10/minute` روی لاگین است (پاسخ `429 RATE_LIMIT_EXCEEDED`). برای تست پایدار: در هر اسکریپت فقط **یک لاگین**، بین اجراها **۶۰+ ثانیه** صبر، و برای WS هم توکن تازه بگیرید (اسکریپت‌ها همین الگو را دارند). `401`های پراکنده‌ی میانیِ اجراهای شلوغ دقیقاً همین علت را دارند، نه باگ — با یک لاگین تمیز همه‌چیز 200 می‌شود.
 
 ---
 
@@ -322,11 +335,110 @@ const CryptoJS = require('crypto-js')   // ❌ در مرورگر وجود ندا
 
 ---
 
+## ۸ه. مایگریشن `core.outbox_messages` (۲۱ سپتامبر ۲۰۲۶) — لاگین 500 می‌داد
+
+### علائم
+پس از راه‌اندازی تازه، `POST /api/v1/auth/login` با **500** شکست:
+```
+asyncpg.exceptions.UndefinedTableError: relation "core.outbox_messages" does not exist
+[SQL: INSERT INTO core.outbox_messages (event_id, event_type, payload, ...)]
+```
+علت: الگوی **transactional outbox** (سند بخش ۲.۳) هنگام ورود، رویداد دامنه را در `core.outbox_messages` ثبت می‌کند ولی این جدول در دیتابیس وجود نداشت.
+
+### ریشه
+فایل `backend/alembic_versions/xxxx_create_core_outbox_messages.py` (قدیمی) یک **قالب** بود (`revision = REPLACE_ME`) و در دایرکتوری اشتباه رها شده بود (خارج از `script_location = alembic`)، پس هرگز توسط alembic شناسایی و اعمال نشد. `alembic heads` فقط `0001_initial` را نشان می‌داد.
+
+### راه‌حل (اعمال شده)
+- مایگریشن واقعی ساخته شد: `backend/alembic/versions/0002_core_outbox.py` (`revision = "0002_core_outbox"`, `down_revision = "0001_initial"`) — ساخت `SCHEMA core` + جدول `outbox_messages` + ایندکس جزئی `ix_outbox_pending`.
+- اجرا: `.\.venv\Scripts\python.exe -m alembic upgrade head` → `current` اکنون `0002_core_outbox (head)`.
+- قالب قدیمی `backend/alembic_versions/xxxx_...` حذف شد.
+- تأیید: `smoke.py` — `login 200` و هر ۱۸ endpoint 200 ✅
+
+### نکته برای دیتابیس تازه
+اگر دیتابیس از نو ساخته می‌شود، `alembic upgrade head` این مایگریشن را هم می‌آورد؛ مراحل بخش ۳ نیازی به تغییر ندارد.
+
+---
+
+## ۸و. WebSocket + Redis + SSO/SPNEGO (۲۲ سپتامبر ۲۰۲۶)
+
+### WebSocket (معماری 5.5 / 12.8) — پیاده‌سازی شد و تأیید شد
+- `backend/app/ws/routes.py` — دو گیتوی:
+  - `GET /ws/chat` — accept→origin check (4403)→JWT در query (4401)→revalidation هر 60s (4401)→idle 300s (4408)→سقف 8192 بایت (1009)→rate-limit 20 پیام/دقیقه (RATE_LIMITED)→فریم‌های `join/message/leave/ping`→بررسی عضویت به‌ازای هر پیام (NOT_A_MEMBER/NOT_JOINED)→ذخیره پیام با SQL خام در `chat.messages`→`_sanitize_html`
+  - `GET /ws/notifications` — فریم اول `unread_count`، سپس اشتراک کانال `notifications:{user_id}` برای push زنده
+- `backend/app/ws/manager.py` — `ConnectionManager` (ثبت سوکت درون‌فرایندی + relay روی کانال `room:{room_id}`)؛ `broadcast` فقط publish می‌کند و relay تحویل می‌دهد (ضد تحویل دوباره)
+- `backend/app/core/redis.py` — `RedisBroker` (پابلیش/اشتراک async + cache); وقتی Redis در دسترس نیست به fan-out درون‌فرایندی ارتجاع می‌دهد (تک‌فرایند پابرجاست)
+- `backend/app/core/security.py` — `get_device_fingerprint`، `verify_hmac_signature`، `hmac_sign`
+- `backend/app/modules/notification/events.py::_publish_live` — بعد از درج notification، پیام JSON به کانال `notifications:{user_id}` پابلیش می‌شود
+- mount در `main.py`: `app.include_router(websocket_router)` بدون پیشوند → مسیرها `/ws/chat` و `/ws/notifications`
+
+### تأیید (همه روی سرور در حال اجرا)
+```
+bad token → close 4401 ✅   join ×2 → connected ✅   broadcast به a+b ✅
+oversize → MESSAGE_TOO_LARGE ✅   non-member → NOT_A_MEMBER ✅
+rate-limit: RATE_LIMITED بعد از پیام ۲۰ ✅
+notifications: unread_count → login → push auth.login.succeeded → unread_count جدید ✅
+```
+
+### مدیریت کاربران ادمین و بخش‌های جدید تنظیمات (۲۲ سپتامبر ۲۰۲۶)
+- روتر `/admin/users` (فهرست/ایجاد/ویرایش/تغییر انبوه حالت ورود) که نه mount بود نه deps واقعی داشت، سرهم‌بندی شد:
+  - `app/modules/auth/api/deps.py` جدید — `get_admin_user_service` واقعی (با `UserRepository` زنده) + re-export شدن `get_current_user` از core تا `require_permission` رزولو شود
+  - `app/modules/rbac/api/deps_internal.py` جدید — `get_permission_service` واقعی (PermissionService با session؛ بدون Redis)
+  - `app/modules/auth/__init__.py` حالا هر دو روتر `auth` و `admin/users` را include می‌کند
+  - `require_permission` در `rbac/api/deps.py` اصلاح شد: چون `get_current_user` رشته (id) برمی‌گرداند، `user.id` خطا می‌داد → حالا str و object هر دو پشتیبانی می‌شوند
+  - `AdminUserService` حالا actor رشته‌ای را هم می‌پذیرد (`_actor_id`)
+- مدل ORM `Users` با DDL هم‌خط شد: ستون‌های `sso_enabled` + `ldap_dn/object_guid/sam_account/synced_at` اضافه شدند (قبلاً `bulk_change_login_mode` روی attribute ناموجود می‌نشست)
+- دسترسی‌های گمشده `user.read/user.create/user.manage` در `rbac.permissions` سید و به `super_admin` اعطا شد (قبلاً فقط `user.bulk_login_mode` بود → همه guardها 403 می‌دادند)
+- endpoint جدید `GET /api/v1/auth/sso/status` در ssoldap: وضعیت SSO/LDAP بدون افشای secret (enabled، ldap3 نصب، server URI، base DN، auto-provision، kerberos، group-role-map + مسیرهای negotiate/ldap-login)
+- چرخه تأییدشده: `list 200 (total=5)` → `create 201` → `deactivate 200` → `bulk sso 200 (updated=[id])` → `reactivate 200` ✅
+- فرانت‌اند (`web/src/features/SettingsPage.tsx`): دو کارت جدید
+  - **مدیریت کاربران (تعریف کاربر)** — فهرست + جست‌وجو + فرم ایجاد (username/کدملی/نام نمایشی/رمز موقت) + دکمه فعال/غیرفعال (محافظت از self) + دکمه فعال‌سازی/غیرفعال‌سازی SSO برای هر کاربر + **انتخاب نقش از dropdown** (assign/revoke با `/rbac/assign` و `/rbac/revoke`)؛ اگر 403 بگیرد «دسترسی ندارید» نشان می‌دهد
+  - **SSO و LDAP** — خواندن `/auth/sso/status` و نمایش ۹ ردیف وضعیت + راهنمای فعال‌سازی SSO از بخش کاربران
+- تأیید: `npm run build` موفق (۱۷۶ ماژول)؛ فرانت روی `http://127.0.0.1:3000` بالا و 200
+
+### رفع مشکل گروه‌ها و افزودن عضو از لیست کاربران (۲۳ سپتامبر ۲۰۲۶)
+- مشکل «ایجاد گروه ناموفق بود» در فرانت: بک‌اند سالمه (`POST /groups/` با همین بدنه 200 برمی‌گرداند؛ زنجیره‌ی
+  stale-token→401→refresh→retry هم تأیید شد 200). علت واقعی، نوسان توکن در هنگام تست هم‌زمان (هر لاگین
+  token_version را بالا می‌برد → 401) و پنجره‌ی ریت‌لیت auth (۱۰/دقیقه که شامل `/auth/refresh` هم هست → 429)
+  بود. در فرانت حالا پیام خطای واقعی سرور نمایش داده می‌شود (به‌جای پیام generic).
+- مشکل «کاربر ایجادشده را نمی‌توان به گروه اضافه کرد»: ریشه در این بود که فرم افزودن، یک input متنی برای
+  user_id داشت و اگر کاربر `ghasemi` تایپ می‌کرد، بک‌اند `422` می‌داد (الگوی لاگ: `found 'g' at 1`).
+- اصلاح `web/src/features/GroupsPage.tsx`:
+  - فهرست کاربران سیستم (`/admin/users`) یک‌بار هنگام mount خوانده می‌شود (با برچسب فارسی مرتب‌شده).
+  - فرم افزودن عضو → **dropdown «انتخاب از کاربران سیستم»** (نام نمایشی/کاربرنam نمایش داده می‌شود، به‌جای
+    تایپ دستی)؛ کاربرانِ فعلاً عضوِ گروه از لیست حذف می‌شوند؛ کاربر غیرفعال با برچسب «غیرفعال» می‌آید.
+  - لیست اعضا حالا **نام نمایشی + ۸ کاراکتر اول UUID** را نشان می‌دهد (نه UUID خام).
+  - خطای create/add از response سرور به‌روز رسیدی می‌شود.
+- تأیید E2E یک‌جا: login → create group 200 → owner_id==admin → `/admin/users` → add member با UUID
+  (همان چیزی که dropdown می‌فرستد) 200 → members 200. `npm run build` موفق.
+
+### نکته‌ی فرم ایجاد کاربر در تنظیمات
+
+### اتصال Audit به رویدادها و integrity (۲۲ سپتامبر ۲۰۲۶)
+- `app/modules/audit/__init__.py` از استاب به real تغییر کرد: `register_event_handlers` از `events.py` صدا زده می‌شود — حالا لاگین موفق/ناموفق و رویدادهای auth/rbac در `audit.login_audit_logs` / `audit.audit_logs` با زنجیره‌ی هش (advisory lock) ثبت می‌شوند.
+- `app/audit/integrity.py` (که ایمپورت خرابی داشت) بازنویسی شد تا زنجیره‌ی هر دو جدول را با همان فرمول `AuditService` بازمحاسبه و تأیید کند؛ `GET /api/v1/audit/integrity-check` → `{"status":"integrity_ok","total_logs":…,"broken_links":0,…}`.
+- ⚠️ ترگر سرگردان دیتابیس (`audit.compute_row_hash()` روی `audit_logs` و `login_audit_logs`) حذف شد: هم `login_audit_logs` (ستون `action` ندارد) را می‌شکست، هم با فرمول app تداخل داشت — مطابق کامنتِ خود `backend/alembic/versions/audit_schema.sql` هیچ ترگرهش روی این جدول‌ها نباید باشد.
+- پاکسازی: فایل‌های اسکله‌ی بلااستفاده‌ی پچ قدیمی از `calendar` و `files` (که هیچ route به آن‌ها import نداشت و در git هم نبودند) حذف شدند؛ پیاده‌سازی واقعی `calendar_service.py` و `files_service.py` بی‌تغییر ماند.
+
+### نکته تست push زنده (مهم)
+برای تست live notification، لاگین **باید روی همان پروسه‌ای** باشد که سوکت WS روی آن باز است؛ در حالتی که سوکت روی 8001 و لاگین روی 8000 است، notification در دیتابیس مشترک ساخته می‌شود ولی پابلیش به broker پروسه‌ی اشتباه می‌رود و به سوکت نمی‌رسد.
+
+### Redis
+- سرور Redis هنوز نصب نیست؛ `RedisBroker` در بدترین حالت به in-memory pub/sub ارتجاع می‌دهد (لاگ: `redis unavailable; using in-memory pub/sub`).
+- برای چند-worker پشت load balancer به Redis واقعی نیاز است (کانفیگ از قبل در `settings.redis_url` است).
+
+### SSO / SPNEGO (معماری امنیت لایه‌بندی‌شده)
+- `POST /api/v1/auth/sso/ldap-login` — کامل (با `ldap3`؛ در غیاب AD → 401 `LDAP_UNAVAILABLE`)
+- `GET /api/v1/auth/sso/negotiate` — هنگام نبود هدر → 401 `SPNEGO_CHALLENGE` + هدر `WWW-Authenticate: Negotiate`؛ وقتی هدر `Authorization: Negotiate ...` هست ولی Kerberos کانفیگ نیست → 501 `KERBEROS_NOT_CONFIGURED`
+- کلیدهای کانفیگ: `LDAP_KERBEROS_ENABLED` (پیش‌فرض `False`) و `LDAP_KERBEROS_KEYTAB` (خالی) در `app/core/config.py`
+
+---
+
 ## ۸. چرخه‌های تأییدشده (تست end-to-end روی سرور در حال اجرا)
 
 ```
 REGISTER 201 → LOGIN 200 (access+refresh token) → ME 200 (کد ملی ماسک‌شده)
 → DEVICES 200 → LOGOUT 200 → ME بعد از logout = 401 ✅
+LOGIN 200 → audit.login_audit_logs+1 → GET /audit/integrity-check → {"status":"integrity_ok","broken_links":0} ✅
 ```
 
 ---
@@ -335,10 +447,12 @@ REGISTER 201 → LOGIN 200 (access+refresh token) → ME 200 (کد ملی ماس
 
 | مورد | وضعیت | توضیح |
 |---|---|---|
-| MFA کامل (TOTP) | ❌ استاب خالی (`auth/db/mfa.py`) | متدهای `generate_mfa_token/verify_token/enroll` وجود ندارند؛ چون کاربران جدید `mfa_enabled=False` دارند ورود عادی کار می‌کند. پیاده‌سازی TOTP نیازمند `pyotp` وフロ کامل enroll/verify است |
-| ۵ ماژول stub | ❌ اسکلت | `calendar, notification, audit, ssoldap, files` فقط router نمونه دارند؛ اسکیمای SQL آن‌ها آماده است |
-| دریفت ORM از DDL | ✅ دور زده شد | سرویس‌های هر ۷ ماژول با SQL خام روی DDL واقعی بازنویسی شدند (بخش ۸ج)؛ مدل‌های ORM منحرف هنوز در `db/Models.py` هستند و استفاده نمی‌شوند — حذف/بازنگری آتی |
-| Redis | ❌ نصب نیست | لازم نیست: rate-limit حافظه‌ای و WebSocket حافظه‌ای است؛ برای چند Worker طبق سند معماری Redis لازم می‌شود |
+| MFA کامل (TOTP) | ✅ انجام شد | enroll/verify/enroll-confirm پیاده شد و چرخه login→mfa_required→verify→توکن تأیید شد (مستندات در OpenAPI `type: string` برای code) |
+| WebSocket chat + notifications | ✅ انجام شد | بخش ۸و؛ `/ws/chat` و `/ws/notifications` با تمام کنترلها (origin/JWT/rate-limit/اندازه/بازارزیابی) |
+| Redis | ✅ fallback درون‌فرایندی | سرور Redis نصب نیست؛ `RedisBroker` (بخش ۸و) با in-memory pub/sub ارتجاع دارد؛ Redis واقعی فقط برای چند-worker لازم است |
+| SSO LDAP + Kerberos/SPNEGO | ✅/⚠️ جزئی | ldap-login کامل است؛ negotiate سؤال‌چالش SPNEGO و در غیاب Kerberos 501 می‌دهد؛ Kerberos واقعی نیاز به AD + Keytab دارد |
+| ۵ ماژول stub (calendar, notification, audit, ssoldap, files) | ✅ کامل شد | همه با سرویس SQL خام روی DDL واقعی پیاده و تست شدند (بخش ۸ج/۸و) |
+| دریفت ORM از DDL | ✅ دور زده شد | سرویس‌های هر ۷ ماژول با SQL خام روی DDL واقعی بازنویسی شدند (بخش ۸ج)؛ اسکله‌های ORM بلااستفاده (calendar/files) حذف شدند — مدل‌های منحرف باقی‌مانده در `db/Models.py` استفاده نمی‌شوند؛ بازنگری آتی |
 | نقش‌های کاربر `admin` | ✅ انجام شد | seed RBAC (بخش ۸ج): ۵ نقش + ۲۴ دسترسی + اعطای `super_admin` به `admin` |
 | باطل‌شدن نشست‌های قبلی با هر login | ⚠️ رفتار فعلی | به‌خاطر `token_version++` در صدور توکن، ورود جدید نشست‌های قبلی را می‌اندازد؛ اگر چنددستگاهی می‌خواهید بازبینی شود |
 
@@ -347,13 +461,24 @@ REGISTER 201 → LOGIN 200 (access+refresh token) → ME 200 (کد ملی ماس
 ## ۱۰. اجرای روزمره (خلاصه)
 
 ```powershell
-# ترمینال ۱ — بک‌اند
+# ترمینال ۱ — بک‌اند (پشت‌زمینه، از هر shell که بسته شود هم زنده می‌ماند)
 cd C:\Projects\Run_Projects_in_Git\Activity_dashboard\backend
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+cmd /c "start /b .venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > %TEMP%\opencode\srv8000.log 2>&1"
 
 # ترمینال ۲ — فرانت‌اند
 cd C:\Projects\Run_Projects_in_Git\Activity_dashboard\web
 npm run dev
+```
+
+> نکته ویندوز: وقتی بک‌اند را با `cmd start /b` بالا می‌آورید، wrapper که shell را می‌بندد ممکن است پیام `ChildProcess.kill` بدهد؛ این **طبیعی است** — فرزند جدا شده و بالا می‌ماند. دستور `Stop-Process` زیر پیش از راه‌اندازی مجدد، همه‌ی پایتون‌های uvicorn را می‌کشد:
+> `Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -match 'uvicorn' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`
+
+### بررسی سلامت پس از راه‌اندازی
+```powershell
+Invoke-WebRequest http://127.0.0.1:8000/health     # {"status":"healthy", ... 13 module}
+Invoke-WebRequest http://127.0.0.1:3000            # 200
+# لاگین واقعی با Endpoint (نه فقط صفحه):
+# POST /api/v1/auth/login  {"identifier":"admin","password":"admin123"}
 ```
 
 | نشانی | کاربرد |

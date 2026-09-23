@@ -60,10 +60,11 @@ def require_permission(*codes: str, mode: str = "all"):
         user=Depends(get_current_user),
         permission_service: PermissionService = Depends(get_permission_service),
     ):
-        perms = await permission_service.effective_permissions(user.id)
+        user_id = user if isinstance(user, str) else str(user.id)
+        perms = await permission_service.effective_permissions(user_id)
         ok = all(c in perms for c in codes) if mode == "all" else any(c in perms for c in codes)
         if not ok:
-            await _publish_denied(user.id, codes, request.url.path)
+            await _publish_denied(user_id, codes, request.url.path)
             raise PermissionDeniedError("ACCESS_DENIED", required=codes, path=request.url.path)
         return user
 

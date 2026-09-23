@@ -18,19 +18,25 @@ from app.core.database import dispose_engine, engine
 from app.core.errors import register_exception_handlers
 from app.core.events import event_bus
 from app.core.middleware import register_middlewares
+from app.core.redis import get_redis_broker
 from app.modules import auth, rbac, groups, goals, sharing, chat, inbox, \
-                        reporting, notification, audit, ssoldap, files
+                        reporting, notification, audit, ssoldap, files, calendar
+from app.ws.routes import router as websocket_router
 
 logging.basicConfig(level=settings.LOG_LEVEL, format=settings.LOG_FORMAT)
 
 # Module order matters for initialization
 MODULES = [auth, rbac, groups, goals, sharing,
-           chat, inbox, reporting, notification, audit, ssoldap, files]
+           chat, inbox, reporting, notification, audit, ssoldap, files, calendar]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
+    # Redis publisher/subscriber pool (in-memory fallback when unreachable)
+    broker = get_redis_broker()
+    await broker.connect()
+
     # Event bus subscriptions (modules without handlers are skipped)
     for m in MODULES:
         register = getattr(m, "register_event_handlers", None)
@@ -41,6 +47,7 @@ async def lifespan(app: FastAPI):
 
     # Graceful shutdown: return pooled connections to PostgreSQL
     await shutdown_gracefully()
+    await broker.close()
 
 
 _docs_enabled = not settings.is_production
@@ -69,6 +76,9 @@ for m in MODULES:
     router = getattr(m, "router", None)
     if router is not None:
         app.include_router(router, prefix="/api/v1")
+
+# --- WebSocket gateway (architecture 5.5: /ws/chat, /ws/notifications) ---
+app.include_router(websocket_router)
 
 async def shutdown_gracefully():
     """Graceful shutdown routine."""
